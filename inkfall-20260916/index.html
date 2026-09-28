@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%2315102b'/%3E%3Ccircle cx='8' cy='6' r='3' fill='%2348e0d0'/%3E%3Crect x='3' y='12' width='10' height='2' fill='%23ffb84d'/%3E%3C/svg%3E">
+<title>INKFALL — draw fading ramps, catch the gems</title>
+<style>
+  html,body{margin:0;padding:0;background:#0b0820;height:100%;overflow:hidden;
+    -webkit-user-select:none;user-select:none;touch-action:none;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{background:#15102b;touch-action:none;display:block;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv" width="480" height="800"></canvas></div>
+<script>
+"use strict";
+/* ============ INKFALL — draw fading ink ramps, route falling gems into a sliding
+   basket; defuse bombs AWAY from it. One life, instant restart. ============ */
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const W = 480, H = 800, FLOOR = 772, DRAW_MAX_Y = 690, BASKET_Y = 744, BW = 108;
+const GRAV = 620, R_G = 14, R_B = 15, HALF_LW = 3.5;
+const STROKE_LIFE = 3.6, STROKE_COST = 0.55, STROKE_MAXLEN = 175;
+const INK_MAX = 100, INK_REGEN = 50, INK_DELAY = 0.3;
+const COMBO_WIN = 2.5;
+
+let state = 'MENU'; // MENU | PLAY | DYING | OVER
+let tGame = 0, score = 0, combo = 0, comboT = 0, best = 0, bestCombo = 0;
+let gems = [], bombs = [], strokes = [], parts = [], floats = [];
+let ink = INK_MAX, inkDelay = 0, drawing = null; // drawing = {pts:[],len:0}
+let basket = { x: W/2, dir: 1 };
+let shake = 0, flash = 0, deathCause = '', causes = {}, deaths = 0, caught = 0;
+let spawnT = 1.2, dT = 0, lastTs = 0, fpsN = 0, fpsT = 0, fps = 60;
+let lastDeathAt = 0, lastDeathPos = 0;
+const histBuf = [];
+
+try { best = +(localStorage.getItem('inkfall_best') || 0); bestCombo = +(localStorage.getItem('inkfall_bestcombo') || 0); } catch(e) {}
+
+/* ---------- audio (WebAudio synth, no files) ---------- */
+let AC = null;
+function ac(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return AC; }
+function tone(f0, f1, dur, type, vol, when){
+  const a = ac(); if(!a) return;
+  const t = a.currentTime + (when||0);
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type||'sine'; o.frequency.setValueAtTime(f0, t);
+  if(f1) o.frequency.exponentialRampToValueAtTime(Math.max(30,f1), t+dur);
+  g.gain.setValueAtTime(vol||0.15, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t+dur);
+  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+dur+0.02);
+}
+function noiseBurst(dur, vol){
+  const a = ac(); if(!a) return;
+  const n = a.sampleRate*dur, buf = a.createBuffer(1, n, a.sampleRate), d = buf.getChannelData(0);
+  for(let i=0;i<n;i++) d[i] = (Math.random()*2-1)*(1-i/n);
+  const s = a.createBufferSource(); s.buffer = buf;
+  const g = a.createGain(); g.gain.value = vol||0.2;
+  s.connect(g); g.connect(a.destination); s.start();
+}
+const S = {
+  catch(c){ const f = 420*Math.pow(1.12, Math.min(c,8)); tone(f, f*1.6, 0.14, 'triangle', 0.18); tone(f*2, 0, 0.07, 'sine', 0.08); },
+  drawTick(){ tone(190, 210, 0.03, 'square', 0.025); },
+  bombNear(){ tone(120, 60, 0.25, 'sawtooth', 0.2); noiseBurst(0.12, 0.1); },
+  death(){ tone(300, 55, 0.5, 'sawtooth', 0.22); noiseBurst(0.3, 0.18); },
+  start(){ tone(330, 660, 0.12, 'triangle', 0.15); tone(660, 990, 0.12, 'triangle', 0.12, 0.1); }
+};
+
+/* ---------- difficulty ramp ---------- */
+function ramp(){ return Math.min(1, tGame/150); }
+function capZoneTrack(r){ return (BASKET_Y-40) - (110-40*r); }
+function spawnInterval(){ return 1.55 - 0.85*ramp(); }          // 1.55s -> 0.70s
+function basketSpeed(){ return 55 + 85*ramp(); }                // px/s
+function bombChance(){
+  if(tGame < 14) return 0;
+  return 0.10 + 0.22*ramp();                                    // 10% -> 32%
+}
+
+/* ---------- entities ---------- */
+function spawnDrop(){
+  const x = 45 + Math.random()*(W-90);
+  if(Math.random() < bombChance()) bombs.push({ x, y:-24, vx:(Math.random()*2-1)*22, vy:30+50*ramp(), r:R_B, near:false });
+  else gems.push({ x, y:-24, vx:(Math.random()*2-1)*20, vy:30+45*ramp(), r:R_G });
+}
+function reset(){
+  tGame=0; score=0; combo=0; comboT=0; ink=INK_MAX; inkDelay=0; drawing=null;
+  gems=[]; bombs=[]; strokes=[]; parts=[]; floats=[];
+  basket.x = W/2; basket.dir = 1; shake=0; flash=0; deathCause=''; caught=0;
+  spawnT = 0.9; state='PLAY';
+}
+function addFloat(x, y, txt, col){ floats.push({x, y, txt, col, t:0.9}); }
+function burst(x, y, col, n, spd){
+  for(let i=0;i<(n||10);i++){
+    const a = Math.random()*Math.PI*2, v = (spd||120)*(0.3+Math.random());
+    parts.push({x, y, vx:Math.cos(a)*v, vy:Math.sin(a)*v-40, t:0.5+Math.random()*0.3, col});
+  }
+}
+function die(cause){
+  deathCause = cause; causes[cause] = (causes[cause]||0)+1; deaths++;
+  lastDeathAt = Math.round(tGame*10)/10; lastDeathPos = Math.round(gems.concat(bombs).length);
+  try{
+    window.__deathDump = JSON.stringify({ t: Math.round(tGame*100)/100, cause,
+      basket: Math.round(basket.x),
+      strokes: strokes.map(s=>s.pts.map(p=>[Math.round(p.x),Math.round(p.y)])),
+      hist: histBuf.slice(-90) });
+  }catch(e){ window.__deathDump = 'dump-failed'; }
+  state='DYING'; dT=0; shake=16; flash=0.5; S.death();
+  if(score > best){ best = score; try{ localStorage.setItem('inkfall_best', best); }catch(e){} }
+  if(combo > bestCombo){ bestCombo = combo; try{ localStorage.setItem('inkfall_bestcombo', bestCombo); }catch(e){} }
+}
+
+/* ---------- stroke / ink ---------- */
+function beginStroke(x, y){
+  y = Math.min(y, DRAW_MAX_Y);
+  if(ink < 12) return;
+  drawing = { pts:[{x, y}], len:0 };
+}
+function extendStroke(x, y){
+  if(!drawing) return;
+  y = Math.min(y, DRAW_MAX_Y);
+  if(drawing.pts.length === 0){ drawing.pts.push({x, y}); return; }
+  const p = drawing.pts[drawing.pts.length-1];
+  const dx = x-p.x, dy = y-p.y, d = Math.hypot(dx, dy);
+  if(d < 11) return;
+  if(drawing.len + d > STROKE_MAXLEN || ink - (drawing.len+d)*STROKE_COST <= 0){ endStroke(); return; }
+  drawing.pts.push({x, y}); drawing.len += d;
+  if(drawing.pts.length % 3 === 0) S.drawTick();
+}
+function endStroke(){
+  if(!drawing) return;
+  if(drawing.pts.length >= 2){
+    strokes.push({ pts:drawing.pts, born:tGame });
+    ink -= drawing.len*STROKE_COST; inkDelay = INK_DELAY;
+    if(strokes.length > 5) strokes.shift();
+  }
+  drawing = null;
+}
+function segPush(g, x1, y1, x2, y2){
+  // one-way platform: only the UP-facing surface collides; normal is the
+  // surface normal (never a radial cap normal) => predictable rolls, no tip chaos
+  const ex = x2-x1, ey = y2-y1, L = Math.hypot(ex, ey);
+  if(L < 1) return null;
+  let nx = -ey/L, ny = ex/L;
+  if(ny > 0){ nx = -nx; ny = -ny; }          // force normal to point up
+  let u = ((g.x-x1)*ex + (g.y-y1)*ey) / (L*L); u = Math.max(0, Math.min(1, u));
+  const cx = x1+ex*u, cy = y1+ey*u;
+  const s = (g.x-cx)*nx + (g.y-cy)*ny;       // signed height above surface
+  const rr = g.r + HALF_LW;
+  if(s <= 0 || s >= rr) return null;         // below surface: pass through
+  return { nx, ny, pen: rr-s };
+}
+function dropVsStrokes(g){
+  for(const st of strokes){
+    for(let i=0;i<st.pts.length-1;i++){
+      const hit = segPush(g, st.pts[i].x, st.pts[i].y, st.pts[i+1].x, st.pts[i+1].y);
+      if(hit){
+        g.x += hit.nx*hit.pen; g.y += hit.ny*hit.pen;
+        const vn = g.vx*hit.nx + g.vy*hit.ny;
+        if(vn < 0){
+          // split into normal/tangent, damp tangent (felt friction => rolls, not launches)
+          const tx = -hit.ny, ty = hit.nx;
+          const vt = g.vx*tx + g.vy*ty;
+          const vn2 = -vn*0.12, vt2 = vt*0.75;
+          g.vx = hit.nx*vn2 + tx*vt2;
+          g.vy = hit.ny*vn2 + ty*vt2;
+        }
+      }
+    }
+  }
+}
+
+/* ---------- update ---------- */
+function update(dt){
+  if(state === 'DYING'){
+    dT += dt; updateFx(dt);
+    if(dT > 0.55) state = 'OVER';
+    return;
+  }
+  if(state !== 'PLAY'){ updateFx(dt); return; }
+  tGame += dt;
+  histBuf.push([Math.round(tGame*100)/100,
+    gems.map(g=>[Math.round(g.x),Math.round(g.y),Math.round(g.vx),Math.round(g.vy)]).join(';'),
+    Math.round(basket.x),
+    strokes.length, Math.round(ink)]);
+  if(histBuf.length > 400) histBuf.shift();
+
+  // ink regen
+  if(!drawing){
+    if(inkDelay > 0) inkDelay -= dt;
+    else ink = Math.min(INK_MAX, ink + INK_REGEN*dt);
+  }
+  strokes = strokes.filter(st => (tGame - st.born) < STROKE_LIFE);
+
+  // basket slide (predictable sine-ish ping-pong = fair)
+  const bs = basketSpeed();
+  basket.x += basket.dir * bs * dt;
+  if(basket.x < 70){ basket.x = 70; basket.dir = 1; }
+  if(basket.x > W-70){ basket.x = W-70; basket.dir = -1; }
+
+  // spawn
+  spawnT -= dt;
+  if(spawnT <= 0){ spawnDrop(); spawnT = spawnInterval()*(0.8+Math.random()*0.4); }
+
+  // gems
+  for(let i=gems.length-1;i>=0;i--){
+    const g = gems[i];
+    const steps = 1 + Math.floor(Math.max(Math.abs(g.vx), Math.abs(g.vy)+GRAV*dt)*dt/8);
+    const sdt = dt/steps;
+    for(let s2=0;s2<steps;s2++){
+      g.vy = Math.min(g.vy + GRAV*sdt, 560);
+      g.x += g.vx*sdt; g.y += g.vy*sdt;
+      if(g.x < g.r){ g.x=g.r; g.vx=Math.abs(g.vx); }
+      if(g.x > W-g.r){ g.x=W-g.r; g.vx=-Math.abs(g.vx); }
+      // basket magnet assist (gems only): near-misses curve in; band narrows with ramp
+      const cap = BASKET_Y-40, capBand = 110-40*ramp(), capR = (150-30*ramp());
+      const dx = basket.x - g.x;
+      if(g.y > cap-capBand && g.y < cap+capBand && Math.abs(dx) < capR){
+        const str = tGame < 30 ? 1600 : 1250;
+        g.vx += Math.sign(dx)*str*sdt;
+        g.vx *= (1-1.5*sdt);
+        if(Math.abs(g.vx) > 300) g.vx = Math.sign(g.vx)*300;
+      }
+      dropVsStrokes(g);
+    }
+    // anti-stall: a drop balanced on a stroke tip gets popped loose
+    if(Math.abs(g.vx) < 15 && Math.abs(g.vy) < 15){
+      g.stall = (g.stall || 0) + dt;
+      if(g.stall > 0.9){
+        g.stall = 0;
+        g.popSide = !(g.popSide);
+        g.vx = (g.popSide ? 150 : -150) + (g.x < W/2 ? 40 : -40);
+        g.vy = -210;
+      }
+    } else g.stall = 0;
+    if(g.y > capZoneTrack(ramp()) && Math.random() < 0.3 && Math.abs(g.x-basket.x) < 130){
+      parts.push({x:g.x, y:g.y, vx:0, vy:-60, t:0.25, col:'#ffb84d'});
+    }
+    if(g.y > BASKET_Y-8 && g.y < BASKET_Y+26 && Math.abs(g.x-basket.x) < BW/2-2){
+      gems.splice(i,1); caught++;
+      combo = (comboT > 0) ? combo+1 : 1; comboT = COMBO_WIN;
+      const mult = Math.min(combo, 5);
+      score += 10*mult;
+      addFloat(g.x, BASKET_Y-18, '+'+(10*mult), '#48e0d0');
+      burst(g.x, BASKET_Y-6, '#48e0d0', 12, 140); S.catch(combo);
+      continue;
+    }
+    if(g.y - g.r > FLOOR){
+      gems.splice(i,1); burst(g.x, FLOOR, '#48e0d0', 16, 180); die('gem_floor');
+      return;
+    }
+  }
+
+  // bombs
+  for(let i=bombs.length-1;i>=0;i--){
+    const b = bombs[i];
+    const bsteps = 1 + Math.floor(Math.max(Math.abs(b.vx), Math.abs(b.vy)+GRAV*dt)*dt/8);
+    const bsdt = dt/bsteps;
+    for(let s3=0;s3<bsteps;s3++){
+      b.vy = Math.min(b.vy + GRAV*bsdt, 560);
+      b.x += b.vx*bsdt; b.y += b.vy*bsdt;
+      if(b.x < b.r){ b.x=b.r; b.vx=Math.abs(b.vx); }
+      if(b.x > W-b.r){ b.x=W-b.r; b.vx=-Math.abs(b.vx); }
+      dropVsStrokes(b);
+    }
+    if(b.y > BASKET_Y-10 && b.y < BASKET_Y+26 && Math.abs(b.x-basket.x) < BW/2+6){
+      bombs.splice(i,1); burst(b.x, BASKET_Y-6, '#ff5a5a', 22, 240); die('bomb_basket');
+      return;
+    }
+    if(b.y - b.r > FLOOR){
+      bombs.splice(i,1); burst(b.x, FLOOR, '#ff5a5a', 14, 150);
+      if(!b.near && Math.abs(b.x-basket.x) < 150){ score += 5; addFloat(b.x, FLOOR-24, 'defused +5', '#ffb84d'); }
+      shake = Math.max(shake, 5); S.bombNear();
+    }
+  }
+
+  if(comboT > 0){ comboT -= dt; if(comboT <= 0) combo = 0; }
+  updateFx(dt);
+}
+function updateFx(dt){
+  shake = Math.max(0, shake - 40*dt);
+  flash = Math.max(0, flash - 1.6*dt);
+  for(let i=parts.length-1;i>=0;i--){
+    const p = parts[i];
+    p.t -= dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vy += 300*dt;
+    if(p.t <= 0) parts.splice(i,1);
+  }
+  for(let i=floats.length-1;i>=0;i--){
+    const f = floats[i];
+    f.t -= dt; f.y -= 34*dt;
+    if(f.t <= 0) floats.splice(i,1);
+  }
+}
+
+/* ---------- render ---------- */
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+function render(){
+  ctx.save();
+  ctx.fillStyle = '#15102b'; ctx.fillRect(0,0,W,H);
+  if(shake > 0) ctx.translate((Math.random()*2-1)*shake, (Math.random()*2-1)*shake);
+
+  // subtle backdrop
+  ctx.strokeStyle = 'rgba(120,110,200,0.06)'; ctx.lineWidth = 1;
+  for(let y=100; y<H; y+=80){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  ctx.fillStyle = 'rgba(120,110,200,0.05)'; ctx.fillRect(0, DRAW_MAX_Y, W, 2);
+
+  // floor
+  ctx.fillStyle = '#221a44'; ctx.fillRect(0, FLOOR, W, H-FLOOR);
+  ctx.fillStyle = '#38306b'; ctx.fillRect(0, FLOOR, W, 3);
+
+  // strokes (fading ink)
+  for(const st of strokes){
+    const age = (tGame - st.born)/STROKE_LIFE;
+    const a = age < 0.75 ? 0.95 : 0.95*(1-(age-0.75)/0.25);
+    ctx.strokeStyle = 'rgba(178,140,255,'+a.toFixed(3)+')';
+    ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.shadowColor = 'rgba(178,140,255,0.7)'; ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.moveTo(st.pts[0].x, st.pts[0].y);
+    for(let i=1;i<st.pts.length;i++) ctx.lineTo(st.pts[i].x, st.pts[i].y);
+    ctx.stroke(); ctx.shadowBlur = 0;
+  }
+  // active drawing
+  if(drawing && drawing.pts.length > 1){
+    ctx.strokeStyle = 'rgba(220,200,255,0.95)'; ctx.lineWidth = 6;
+    ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.shadowColor='rgba(200,170,255,0.9)'; ctx.shadowBlur=12;
+    ctx.beginPath(); ctx.moveTo(drawing.pts[0].x, drawing.pts[0].y);
+    for(let i=1;i<drawing.pts.length;i++) ctx.lineTo(drawing.pts[i].x, drawing.pts[i].y);
+    ctx.stroke(); ctx.shadowBlur = 0;
+  }
+
+  // basket
+  const bx = basket.x;
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,184,77,0.8)'; ctx.shadowBlur = 18;
+  ctx.fillStyle = '#ffb84d';
+  ctx.beginPath();
+  ctx.moveTo(bx-BW/2, BASKET_Y-12); ctx.lineTo(bx+BW/2, BASKET_Y-12);
+  ctx.lineTo(bx+BW/2-14, BASKET_Y+26); ctx.lineTo(bx-BW/2+14, BASKET_Y+26);
+  ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#221a44';
+  ctx.beginPath();
+  ctx.moveTo(bx-BW/2+10, BASKET_Y-6); ctx.lineTo(bx+BW/2-10, BASKET_Y-6);
+  ctx.lineTo(bx+BW/2-20, BASKET_Y+20); ctx.lineTo(bx-BW/2+20, BASKET_Y+20);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+
+  // gems (cyan diamonds)
+  for(const g of gems){
+    ctx.save(); ctx.translate(g.x, g.y); ctx.rotate(tGame*2 + g.x);
+    ctx.shadowColor='rgba(72,224,208,0.9)'; ctx.shadowBlur=12;
+    ctx.fillStyle = '#48e0d0';
+    ctx.beginPath(); ctx.moveTo(0,-g.r); ctx.lineTo(g.r*0.8,0); ctx.lineTo(0,g.r); ctx.lineTo(-g.r*0.8,0);
+    ctx.closePath(); ctx.fill(); ctx.restore(); ctx.shadowBlur=0;
+  }
+  // bombs (red with fuse spark)
+  for(const b of bombs){
+    ctx.save();
+    ctx.shadowColor='rgba(255,90,90,0.9)'; ctx.shadowBlur=14;
+    ctx.fillStyle = '#ff5a5a';
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur=0;
+    ctx.fillStyle = '#ffd0d0';
+    ctx.beginPath(); ctx.arc(b.x-4, b.y-4, 3.2, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#ffb84d'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(b.x+3, b.y-b.r+2);
+    ctx.lineTo(b.x+8+Math.sin(tGame*20)*3, b.y-b.r-6); ctx.stroke();
+    ctx.restore();
+  }
+
+  // particles & floats
+  for(const p of parts){
+    ctx.globalAlpha = Math.max(0, p.t*2);
+    ctx.fillStyle = p.col; ctx.fillRect(p.x-2, p.y-2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+  for(const f of floats){
+    ctx.globalAlpha = Math.min(1, f.t*1.6);
+    ctx.font = 'bold 18px system-ui,sans-serif';
+    ctx.fillStyle = f.col; ctx.fillText(f.txt, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // HUD
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 34px system-ui,sans-serif'; ctx.fillStyle = '#f2eaff';
+  ctx.fillText(String(score), 18, 46);
+  ctx.font = '13px system-ui,sans-serif'; ctx.fillStyle = '#9a8fd0';
+  ctx.textAlign = 'right';
+  ctx.fillText('BEST ' + best, W-18, 28);
+  if(combo > 1){
+    const mult = Math.min(combo,5);
+    ctx.fillStyle = '#ffb84d'; ctx.font = 'bold 20px system-ui,sans-serif';
+    ctx.fillText('x'+mult+' combo', W-18, 52);
+    ctx.fillStyle = 'rgba(255,184,77,0.35)';
+    ctx.fillRect(W-18-100, 60, 100, 4);
+    ctx.fillStyle = '#ffb84d';
+    ctx.fillRect(W-18-100, 60, 100*Math.max(0,comboT/COMBO_WIN), 4);
+  }
+  // ink bar (bottom-left)
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(178,140,255,0.25)'; ctx.fillRect(16, H-22, 120, 8);
+  ctx.fillStyle = '#b28cff'; ctx.fillRect(16, H-22, 120*ink/INK_MAX, 8);
+  ctx.font = '11px system-ui,sans-serif'; ctx.fillStyle = '#9a8fd0';
+  ctx.fillText('INK', 16, H-28);
+
+  if(flash > 0){ ctx.fillStyle = 'rgba(255,80,80,'+(flash*0.35).toFixed(3)+')'; ctx.fillRect(0,0,W,H); }
+
+  if(state === 'MENU' || state === 'OVER'){
+    ctx.fillStyle = 'rgba(11,8,32,0.72)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 54px system-ui,sans-serif'; ctx.fillStyle = '#b28cff';
+    ctx.fillText('INKFALL', W/2, 300);
+    ctx.font = '17px system-ui,sans-serif'; ctx.fillStyle = '#cfc6f5';
+    if(state === 'MENU'){
+      ctx.fillText('Draw fading ramps with your finger.', W/2, 356);
+      ctx.fillStyle = '#48e0d0'; ctx.fillText('Route gems into the golden basket.', W/2, 384);
+      ctx.fillStyle = '#ff5a5a'; ctx.fillText('Lead bombs AWAY — a bomb in the basket ends the run.', W/2, 412);
+      ctx.fillStyle = '#9a8fd0'; ctx.fillText('A gem hitting the floor also ends it.', W/2, 440);
+    } else {
+      ctx.font = 'bold 30px system-ui,sans-serif'; ctx.fillStyle = '#f2eaff';
+      ctx.fillText('SCORE  ' + score, W/2, 366);
+      ctx.font = '16px system-ui,sans-serif'; ctx.fillStyle = '#9a8fd0';
+      ctx.fillText('best ' + best + '  ·  gems ' + caught + '  ·  best combo x' + Math.max(1,Math.min(bestCombo,5)), W/2, 396);
+      ctx.fillStyle = '#cfc6f5'; ctx.font = '17px system-ui,sans-serif';
+      ctx.fillText('Tap to try again', W/2, 436);
+    }
+    if(state === 'MENU'){
+      ctx.fillStyle = '#ffb84d'; ctx.font = 'bold 20px system-ui,sans-serif';
+      ctx.fillText('TAP / CLICK TO START', W/2, 560);
+    }
+  }
+  ctx.restore();
+}
+
+/* ---------- input ---------- */
+function toLocal(e){
+  const r = cv.getBoundingClientRect();
+  return { x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height };
+}
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); ac();
+  const p = toLocal(e);
+  if(state === 'MENU' || state === 'OVER'){ reset(); S.start(); return; }
+  if(state === 'PLAY') beginStroke(p.x, p.y);
+});
+cv.addEventListener('pointermove', e => {
+  e.preventDefault();
+  if(state !== 'PLAY' || !drawing) return;
+  const p = toLocal(e); extendStroke(p.x, p.y);
+});
+window.addEventListener('pointerup', () => { if(drawing) endStroke(); });
+window.addEventListener('pointercancel', () => { if(drawing) endStroke(); });
+
+/* ---------- main loop ---------- */
+function loop(ts){
+  const dt = Math.min(0.033, (ts - lastTs)/1000 || 0.016);
+  lastTs = ts;
+  fpsN++; if(ts - fpsT > 500){ fps = Math.round(fpsN*1000/(ts-fpsT)); fpsN=0; fpsT=ts; }
+  update(dt); render();
+}
+function rafLoop(ts){ loop(ts); requestAnimationFrame(rafLoop); }
+
+/* ---------- autotest bot (?autotest) ---------- */
+let botCd = 0; // bot draw cooldown (s of tGame)
+function botStep(){
+  if(state !== 'PLAY') return;
+  if(tGame - botCd < 0.55) return;
+  // v5: guide the lowest gem with a ramp right under it, aimed at the
+  // PREDICTED basket position (ping-pong integrated forward)
+  let target = null;
+  for(const g of gems) if(!target || g.y > target.y) target = g;
+  if(!target || target.y < 60 || target.y > 580 || ink < 40) return;
+  const gx = Math.max(40, Math.min(W-40, target.x));
+  const y0 = Math.min(target.y + 55, 640), y1 = Math.min(y0 + 46, 686);
+  // predict basket x at landing
+  const tLand = (BASKET_Y - 30 - y1)/560 + 0.35;
+  let px = basket.x, pdir = basket.dir;
+  const spd = basketSpeed();
+  for(let t = 0; t < tLand; t += 0.05){
+    px += pdir*spd*0.05;
+    if(px < 70){ px = 70; pdir = 1; }
+    if(px > W-70){ px = W-70; pdir = -1; }
+  }
+  let aim = Math.max(45, Math.min(W-45, px));
+  const maxRun = Math.sqrt(Math.max(0, (STROKE_MAXLEN-6)*(STROKE_MAXLEN-6) - (y1-y0)*(y1-y0))) - 20; // minus tip offset
+  aim = Math.max(gx-maxRun, Math.min(gx+maxRun, aim));
+  const n0 = strokes.length;
+  drawing = { pts:[], len:0 };
+  if(Math.abs(aim-gx) < 26){
+    const s2 = (aim >= gx) ? 1 : -1;
+    extendStroke(gx - s2*11, y0);
+    extendStroke(gx + s2*13, y1);
+  } else {
+    extendStroke(gx - Math.sign(aim-gx)*20, y0);
+    extendStroke(aim, y1);
+  }
+  endStroke();
+  if(strokes.length > n0) botCd = tGame;  // only cool down when a real stroke landed
+}
+let botT = 0, teleT = 0;
+function autotestDrive(ts){
+  loop(ts);
+  botT += 16;
+  if(botT > 400){ botT = 0; botStep(); }
+  teleT += 16;
+  if(teleT > 200){
+    teleT = 0;
+    document.title = 'st='+state+' sc='+score+' best='+best+' g='+gems.length+' b='+bombs.length
+      +' ink='+Math.round(ink)+' d='+deaths+' causes='+JSON.stringify(causes)
+      +' dAt='+lastDeathAt+' caught='+caught+' fps='+fps;
+  }
+}
+const isAuto = /[?&]autotest/.test(location.search);
+if(isAuto){
+  reset();
+  setInterval(()=>autotestDrive(performance.now()), 16);
+} else {
+  requestAnimationFrame(rafLoop);
+}
+</script>
+</body>
+</html>
