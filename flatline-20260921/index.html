@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>FLATLINE — keep the beat, stay alive</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0e12'/><path d='M1 8h4l2-4 2 8 2-4h4' stroke='%2339ff88' fill='none'/></svg>">
+<style>
+html,body{margin:0;padding:0;background:#0a0e12;height:100%;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+'use strict';
+// ============ setup ============
+const cv = document.getElementById('cv'), X = cv.getContext('2d');
+let W=0,H=0,DPR=1,CX=0,CY=0,SCALE=1;
+function resize(){
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR;
+  X.setTransform(DPR,0,0,DPR,0,0);
+  CX = W/2; CY = H*0.44;
+  SCALE = Math.min(W,H)/480;
+}
+window.addEventListener('resize', resize); resize();
+
+// ============ tuning ============
+const R_START=178, R_HIT=56;        // ring travel radii (logical px)
+const BPM0=75, BPM_DECAY=0.975, BPM_FLOOR=320; // interval ms
+const PERFECT=75, GOOD=160;         // judgment windows ms
+const GRACE=1.5;                    // window multiplier first 10 beats
+const LIVES=3;
+const JITTER=0.07;
+const EVENT_BEAT=18, EVENT_P=0.07, EVENT_GAP=8;
+
+// ============ state ============
+let state='menu';                   // menu | play | dead
+let now=0, last=0;
+let score=0, best=+(localStorage.getItem('flatline_best')||0);
+let combo=0, maxCombo=0, beats=0, maxBpm=0, lives=LIVES;
+let nextBeatAt=0, interval=800, baseInt=800;
+let evLabel=null, evUntil=0, lastEvBeat=-99;
+let shake=0, flash=0, flashCol='#fff', deadAt=0, flatTone=null;
+let bpmShown=0;
+const parts=[];   // particles
+const ecg=[];     // ecg trace points {x,y}
+let ecgX=0;
+
+function reset(){
+  ac();
+  score=0; combo=0; maxCombo=0; beats=0; maxBpm=0; lives=LIVES;
+  baseInt=60000/BPM0; interval=baseInt;
+  evLabel=null; lastEvBeat=-99; shake=0; flash=0;
+  parts.length=0; ecg.length=0; ecgX=0;
+  nextBeatAt=performance.now()+1400;
+  state='play';
+}
+
+// ============ core beat logic ============
+function multOf(c){ return 1+Math.min(4, Math.floor(c/12)); }
+
+function scheduleNext(hitAt){
+  beats++;
+  baseInt = Math.max(BPM_FLOOR, baseInt*BPM_DECAY);
+  let m = 1;
+  if(beats>=EVENT_BEAT && beats-lastEvBeat>EVENT_GAP && Math.random()<EVENT_P){
+    lastEvBeat=beats;
+    if(Math.random()<0.55){ m=0.72; evLabel='TACHY'; } else { m=1.32; evLabel='BRADY'; }
+    evUntil=now+900;
+  }
+  interval = baseInt*m*(1+(Math.random()*2-1)*JITTER);
+  nextBeatAt = hitAt + interval;
+  const b = 60000/interval;
+  if(b>maxBpm) maxBpm=b;
+}
+
+function tap(){
+  if(state==='menu'){ reset(); return; }
+  if(state==='dead'){ if(now-deadAt>600){ reset(); } return; }
+  const d = now - nextBeatAt;
+  const gw = beats<10 ? GRACE : 1;
+  const ad = Math.abs(d);
+  if(ad<=PERFECT*gw){ hit(PERFECT_W); return; }
+  if(ad<=GOOD*gw){ hit(GOOD_W); return; }
+  if(d < -GOOD*gw){ miss(false); return; }   // way early: false beat
+  // d > GOOD handled by auto-miss in update
+  miss(false);
+}
+const PERFECT_W=2, GOOD_W=1;
+
+function hit(q){
+  combo++; if(combo>maxCombo) maxCombo=combo;
+  score += 10*multOf(combo)*(q===PERFECT_W?2:1);
+  burst(q===PERFECT_W?'#ffd75e':'#39ff88', q===PERFECT_W?26:14);
+  flash = q===PERFECT_W?0.22:0.1; flashCol=q===PERFECT_W?'#ffd75e':'#39ff88';
+  thump(1, q===PERFECT_W?880:660);
+  spike(q===PERFECT_W?1:0.55);
+  scheduleNext(now);
+}
+
+function miss(silent){
+  combo=0; lives--;
+  shake=0.5; flash=0.3; flashCol='#ff4d5e';
+  buzz(); spike(silent?0.12:-0.35);
+  if(lives<=0){ die(); return; }
+  if(now>nextBeatAt) scheduleNext(nextBeatAt+interval); // re-anchor after overshoot
+}
+
+function die(){
+  state='dead'; deadAt=now;
+  if(score>best){ best=score; localStorage.setItem('flatline_best', best); }
+  flatlineTone();
+}
+
+function update(dt){
+  shake=Math.max(0,shake-dt*2.2);
+  flash=Math.max(0,flash-dt*1.6);
+  bpmShown += ((nextBeatAt>now? 60000/Math.max(1,nextBeatAt-now):60000/interval) - bpmShown)*Math.min(1,dt*6);
+  if(state==='play' && now-nextBeatAt > GOOD*(beats<10?GRACE:1)){
+    miss(true); // heartbeat skipped entirely
+  }
+  for(let i=parts.length-1;i>=0;i--){ const p=parts[i]; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=140*dt; p.t-=dt; if(p.t<=0) parts.splice(i,1); }
+  stepEcg(dt);
+}
+// ============ audio (WebAudio synth, no files) ============
+let AC=null;
+function ac(){ if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(AC&&AC.state==='suspended') AC.resume(); return AC; }
+function thump(vol,freq){
+  const a=ac(); if(!a) return; const t=a.currentTime;
+  const o=a.createOscillator(), g=a.createGain();
+  o.type='sine'; o.frequency.setValueAtTime(freq,t); o.frequency.exponentialRampToValueAtTime(46,t+0.11);
+  g.gain.setValueAtTime(0.5*vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.14);
+  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+0.16);
+}
+function buzz(){
+  const a=ac(); if(!a) return; const t=a.currentTime;
+  const o=a.createOscillator(), g=a.createGain();
+  o.type='square'; o.frequency.setValueAtTime(130,t);
+  g.gain.setValueAtTime(0.16,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.22);
+  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+0.24);
+}
+function flatlineTone(){
+  const a=ac(); if(!a) return; const t=a.currentTime;
+  const o=a.createOscillator(), g=a.createGain();
+  o.type='sine'; o.frequency.setValueAtTime(740,t);
+  g.gain.setValueAtTime(0.14,t); g.gain.setValueAtTime(0.14,t+1.5); g.gain.linearRampToValueAtTime(0,t+1.9);
+  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+1.9);
+}
+
+// ============ ECG trace ============
+function spike(amp){
+  // queue an ECG waveform segment; drawn as scrolling line at bottom
+  ecg.push({x:ecgX, a:amp});
+}
+function stepEcg(dt){
+  ecgX += 90*dt;                       // scroll speed px/s
+  if(ecg.length>64) ecg.shift();
+  if(ecg.length && ecg[0].x < ecgX-560) ecg.shift();
+}
+// particles
+function burst(col,n){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2, s=60+Math.random()*260;
+    parts.push({x:CX,y:CY,vx:Math.cos(a)*s,vy:Math.sin(a)*s-60,t:0.5+Math.random()*0.4,col});
+  }
+}
+
+// ============ render ============
+function heartPath(x,y,r){
+  X.beginPath();
+  X.moveTo(x, y+r*0.62);
+  X.bezierCurveTo(x-r*1.3, y-r*0.35, x-r*0.62, y-r*1.15, x, y-r*0.42);
+  X.bezierCurveTo(x+r*0.62, y-r*1.15, x+r*1.3, y-r*0.35, x, y+r*0.62);
+  X.closePath();
+}
+function fmt(n){ return String(Math.floor(n)).padStart(6,'0'); }
+
+function draw(){
+  X.save();
+  if(shake>0){ X.translate((Math.random()*2-1)*shake*9,(Math.random()*2-1)*shake*9); }
+  X.fillStyle='#0a0e12'; X.fillRect(-20,-20,W+40,H+40);
+  const beatPulse = state==='play' ? Math.max(0,1-(nextBeatAt-now)/interval) : 0;
+
+  if(state!=='menu'){
+    // heart
+    const hr = (R_HIT*0.62)*(1+beatPulse*0.16);
+    X.globalAlpha=0.18; heartPath(CX,CY,hr*1.5); X.fillStyle='#ff4d5e'; X.fill(); X.globalAlpha=1;
+    heartPath(CX,CY,hr); X.fillStyle='#ff4d5e'; X.fill();
+    // judgment zone
+    X.beginPath(); X.arc(CX,CY,R_HIT,0,7); X.strokeStyle='rgba(255,255,255,0.13)'; X.lineWidth=2; X.stroke();
+    // incoming ring
+    if(state==='play'){
+      const k = Math.max(0,(nextBeatAt-now))/interval;    // 1 -> 0
+      const rr = R_HIT + (R_START-R_HIT)*k;
+      const urgency = 1-k;
+      X.beginPath(); X.arc(CX,CY,rr,0,7);
+      X.strokeStyle = urgency>0.82 ? '#ffd75e' : '#39ff88';
+      X.globalAlpha = 0.35+0.6*urgency; X.lineWidth = 3.5; X.stroke(); X.globalAlpha=1;
+      if(combo>1){
+        X.fillStyle='rgba(255,255,255,0.85)'; X.font=`700 ${28*SCALE|0}px monospace`; X.textAlign='center';
+        X.fillText('x'+multOf(combo)+'  '+combo+' COMBO', CX, CY-R_START*0.72);
+      }
+    }
+    for(const p of parts){ X.globalAlpha=Math.max(0,p.t*2); X.fillStyle=p.col; X.fillRect(p.x-2,p.y-2,4,4); }
+    X.globalAlpha=1;
+  }
+
+  // ECG strip (bottom)
+  const ey = H-64, eh=46;
+  X.fillStyle='rgba(8,12,10,0.85)'; X.fillRect(0,ey-eh,W,eh+30);
+  X.strokeStyle='rgba(57,255,136,0.18)'; X.beginPath(); X.moveTo(0,ey); X.lineTo(W,ey); X.stroke();
+  if(state!=='menu'){
+    X.beginPath();
+    X.moveTo(0,ey);
+    for(let i=0;i<ecg.length;i++){
+      const p=ecg[i];
+      const sx = p.x-(ecgX-W);
+      if(sx<0) continue;
+      X.lineTo(sx,ey);
+      X.lineTo(sx+6, ey - p.a*eh);
+      X.lineTo(sx+12, ey);
+    }
+    X.lineTo(W,ey);
+    X.strokeStyle = state==='dead' ? '#ff4d5e' : '#39ff88'; X.lineWidth=2; X.stroke();
+  }
+
+  // HUD
+  X.textAlign='left'; X.fillStyle='#39ff88'; X.font=`700 ${30*SCALE|0}px monospace`;
+  X.fillText(fmt(score), 16, 40);
+  X.font=`600 ${14*SCALE|0}px monospace`; X.fillStyle='rgba(255,255,255,0.55)';
+  X.fillText('BEST '+fmt(best), 16, 62);
+  X.textAlign='right'; X.fillStyle='#fff';
+  X.font=`800 ${34*SCALE|0}px monospace`;
+  X.fillText(state==='play' ? Math.round(60000/interval)+' BPM' : '-- BPM', W-16, 42);
+  if(state==='play'){
+    let hs=''; for(let i=0;i<LIVES;i++) hs += i<lives?'♥ ':'♡ ';
+    X.fillStyle='#ff4d5e'; X.font=`${22*SCALE|0}px monospace`; X.fillText(hs.trim(), W-16, 68);
+  }
+  if(now<evUntil && evLabel){
+    X.textAlign='center'; X.fillStyle='#ffd75e'; X.font=`800 ${26*SCALE|0}px monospace`;
+    X.globalAlpha=Math.min(1,(evUntil-now)/300); X.fillText('⚠ '+evLabel, CX, 92); X.globalAlpha=1;
+  }
+  if(flash>0){ X.globalAlpha=flash; X.fillStyle=flashCol; X.fillRect(-20,-20,W+40,H+40); X.globalAlpha=1; }
+
+  // overlays
+  X.textAlign='center';
+  if(state==='menu'){
+    X.fillStyle='#ff4d5e'; X.font=`800 ${54*SCALE|0}px monospace`; X.fillText('FLATLINE', CX, H*0.3);
+    X.fillStyle='rgba(255,255,255,0.75)'; X.font=`500 ${16*SCALE|0}px monospace`;
+    X.fillText('Tap the instant the ring meets the heart.', CX, H*0.3+38*SCALE);
+    X.fillText('Your taps set your heart rate — it only gets faster.', CX, H*0.3+62*SCALE);
+    X.fillStyle='#39ff88'; X.font=`700 ${20*SCALE|0}px monospace`;
+    X.globalAlpha=0.6+0.4*Math.sin(now/300); X.fillText('TAP TO START', CX, H*0.72); X.globalAlpha=1;
+  }
+  if(state==='dead'){
+    X.fillStyle='rgba(10,14,18,0.72)'; X.fillRect(0,0,W,H);
+    X.fillStyle='#ff4d5e'; X.font=`800 ${44*SCALE|0}px monospace`; X.fillText('FLATLINE', CX, H*0.32);
+    X.fillStyle='#fff'; X.font=`700 ${22*SCALE|0}px monospace`; X.fillText(fmt(score)+(score>=best&&score>0?'  ★NEW BEST':''), CX, H*0.32+44*SCALE);
+    X.fillStyle='rgba(255,255,255,0.6)'; X.font=`500 ${15*SCALE|0}px monospace`;
+    X.fillText(beats+' beats · max '+Math.round(maxBpm)+' BPM · best combo '+maxCombo, CX, H*0.32+72*SCALE);
+    X.fillStyle='#39ff88'; X.font=`700 ${19*SCALE|0}px monospace`;
+    if(now-deadAt>600){ X.globalAlpha=0.6+0.4*Math.sin(now/300); X.fillText('TAP TO RESUSCITATE', CX, H*0.72); X.globalAlpha=1; }
+  }
+  X.restore();
+}
+
+// ============ input ============
+window.FLATLINE = () => ({state, score, beats, combo, lives, nextBeatAt, interval, maxBpm});
+cv.addEventListener('pointerdown', e=>{ e.preventDefault(); tap(); }, {passive:false});
+window.addEventListener('keydown', e=>{ if(e.code==='Space'||e.code==='Enter'){ e.preventDefault(); tap(); } });
+window.addEventListener('contextmenu', e=>e.preventDefault());
+
+// ============ loop ============
+function loop(t){
+  now=t; const dt=Math.min(0.05,(t-last)/1000)||0.016; last=t;
+  update(dt); draw();
+  if(state==='play') requestAnimationFrame(loop);
+  else requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
