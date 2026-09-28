@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>JAYWALK — judge the gap</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%2323262e'/><rect x='7' y='2' width='2' height='12' fill='%23f2c14e'/></svg>">
+<style>
+  html,body{margin:0;padding:0;background:#15171c;height:100%;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+  body{display:flex;align-items:center;justify-content:center}
+  #cv{background:#23262e;touch-action:none;box-shadow:0 0 60px rgba(0,0,0,.6)}
+</style>
+</head>
+<body>
+<canvas id="cv" width="480" height="800"></canvas>
+<script>
+'use strict';
+/* JAYWALK — one-thumb traffic-gap judgment arcade
+   Tap a third of the screen to send the next pedestrian dashing across
+   rush-hour traffic. Chain crossings for multipliers. One hit ends it. */
+
+const W = 480, H = 800;
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+
+/* ---------- fit-to-screen ---------- */
+function fit(){
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width  = (W * s) + 'px';
+  cv.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+/* ---------- geometry ---------- */
+const COLS = [120, 240, 360];            // crossing column x centers
+const LANE_Y = [195, 325, 455, 585];     // road lane centers
+const CAR_H = 46;
+const WALK_SPEED = 250;                  // px/s upward
+const EXIT_Y = 128;                      // score line
+const SPAWN_Y = 756;                     // people launch from here
+
+/* ---------- audio (WebAudio synth, no files) ---------- */
+let AC = null;
+function audio(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(AC && AC.state==='suspended') AC.resume(); }
+function tone(freq, dur, type, vol, when){
+  if(!AC) return;
+  const t0 = AC.currentTime + (when||0);
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type||'sine'; o.frequency.setValueAtTime(freq, t0);
+  g.gain.setValueAtTime(vol||0.15, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(AC.destination);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function sDispatch(){ tone(340, 0.08, 'triangle', 0.14); tone(510, 0.06, 'triangle', 0.08, 0.04); }
+function sCross(c){ tone(620 * Math.pow(1.045, Math.min(c, 16)), 0.12, 'sine', 0.16); }
+function sNear(){ tone(196, 0.09, 'square', 0.10); tone(233, 0.09, 'square', 0.10, 0.10); }
+function sComboUp(){ tone(880, 0.07, 'sine', 0.12); tone(1175, 0.09, 'sine', 0.12, 0.06); }
+function sCrash(){
+  if(!AC) return;
+  const t0 = AC.currentTime;
+  const len = AC.sampleRate * 0.35, buf = AC.createBuffer(1, len, AC.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 2);
+  const src = AC.createBufferSource(); src.buffer = buf;
+  const g = AC.createGain(); g.gain.setValueAtTime(0.35, t0);
+  src.connect(g); g.connect(AC.destination); src.start(t0);
+  tone(72, 0.4, 'sawtooth', 0.25);
+}
+
+/* ---------- state ---------- */
+const S = { MENU:0, PLAY:1, DYING:2, OVER:3 };
+let state = S.MENU;
+let t = 0;                    // run time
+let score = 0, combo = 0, comboT = 0, maxCombo = 0, crossed = 0;
+let best = +(localStorage.getItem('jaywalk_best') || 0);
+let bestCombo = +(localStorage.getItem('jaywalk_bestcombo') || 0);
+let shake = 0, flash = 0, nearFlash = 0;
+let deathPos = null;
+
+let walkers = [];             // {col,x,y,state:'walk'|'dead'}
+let cars = [];                // {lane,x,y,v,len,color,truck,dir}
+let warnings = [];            // incoming-car telegraphs {lane,dir,truck,len,v,color,t}
+let particles = [];           // {x,y,vx,vy,life,col,size}
+let pops = [];                // floating text {x,y,txt,life,col,size}
+let laneTimers = [0,0,0,0];   // per-lane spawn countdown
+let nearPairs = new Set();    // near-miss dedupe
+
+const CAR_COLORS = ['#e94f4f','#4fa3e9','#f2c14e','#8bd450','#b06ee9','#ef8b3f','#e9d75c'];
+const SHIRT = ['#ff8fa3','#7fd4ff','#c3ff8f','#ffd166','#e0b0ff','#ffab7d'];
+
+function rampSpeed(){ return 1 + Math.min(0.7, t / 167); }
+function laneSpeed(l){ return [110,150,190,230][l] * rampSpeed() * (Math.random()<0.12 ? 1.28 : 1); }
+function densK(){ return Math.max(0.42, 1 - t * 0.0045); }
+
+function spawnCar(lane){
+  const dir = Math.random() < 0.5 ? 1 : -1;   // 1: left->right
+  const truck = t > 25 && Math.random() < 0.22;
+  const len = truck ? 96 : 68;
+  // entrance clearance check
+  for(const c of cars){
+    if(c.lane !== lane) continue;
+    const entryX = dir === 1 ? -len : W + len;
+    if(Math.abs(c.x - entryX) < len + 150) { laneTimers[lane] = 0.15; return; }
+  }
+  // telegraph: headlights glow at the curb 0.38s before the car enters
+  warnings.push({
+    lane, dir, truck, len,
+    v: laneSpeed(lane) * (truck ? 0.9 : 1),
+    color: truck ? '#9aa2b1' : CAR_COLORS[(Math.random()*CAR_COLORS.length)|0],
+    t: 0.38
+  });
+  laneTimers[lane] = (1.5 + Math.random()*0.9) * densK();
+}
+
+function dispatch(col){
+  if(state !== S.PLAY) return;
+  if(walkers.some(wk => wk.col === col && wk.y > SPAWN_Y - 34)) return; // spacing
+  walkers.push({ col, x: COLS[col], y: SPAWN_Y, shirt: SHIRT[(Math.random()*SHIRT.length)|0], wob: Math.random()*6.28 });
+  sDispatch();
+}
+
+function addPop(x, y, txt, col, size){
+  pops.push({ x, y, txt, col, size: size||20, life: 0.9 });
+}
+function burst(x, y, n, col, spread){
+  for(let i=0;i<n;i++){
+    const a = Math.random()*6.28, sp = (Math.random()*0.7+0.3) * (spread||220);
+    particles.push({ x, y, vx: Math.cos(a)*sp, vy: Math.sin(a)*sp - 60, life: 0.5 + Math.random()*0.4, col, size: 2 + Math.random()*3 });
+  }
+}
+
+function reset(){
+  t = 0; score = 0; combo = 0; comboT = 0; maxCombo = 0; crossed = 0;
+  walkers = []; cars = []; warnings = []; particles = []; pops = []; nearPairs.clear();
+  laneTimers = [1.0, 0.6, 0.9, 0.4];
+  shake = 0; flash = 0; nearFlash = 0; deathPos = null;
+}
+
+function die(walker){
+  state = S.DYING;
+  deathPos = { x: walker.x, y: walker.y };
+  walker.state = 'dead';
+  shake = 16; flash = 0.55;
+  sCrash();
+  burst(walker.x, walker.y, 18, '#ff6b5e', 260);
+  window.__causes = window.__causes || {}; window.__causes.car = (window.__causes.car||0) + 1;
+  window.__deaths = (window.__deaths||0) + 1;
+  setTimeout(() => {
+    state = S.OVER;
+    if(score > best){ best = score; localStorage.setItem('jaywalk_best', best); }
+    if(maxCombo > bestCombo){ bestCombo = maxCombo; localStorage.setItem('jaywalk_bestcombo', bestCombo); }
+  }, 900);
+}
+
+/* ---------- update ---------- */
+function update(dt){
+  if(shake > 0) shake = Math.max(0, shake - dt * 40);
+  if(flash > 0) flash = Math.max(0, flash - dt * 1.6);
+  if(nearFlash > 0) nearFlash = Math.max(0, nearFlash - dt * 3);
+
+  for(let i = particles.length - 1; i >= 0; i--){
+    const p = particles[i];
+    p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt;
+    if(p.life <= 0) particles.splice(i, 1);
+  }
+  for(let i = pops.length - 1; i >= 0; i--){
+    pops[i].life -= dt; pops[i].y -= 34 * dt;
+    if(pops[i].life <= 0) pops.splice(i, 1);
+  }
+  if(state !== S.PLAY && state !== S.DYING) return;
+
+  if(state === S.PLAY) t += dt;
+
+  /* combo decay */
+  if(combo > 0){ comboT -= dt; if(comboT <= 0) combo = 0; }
+
+  /* promote telegraphs to cars */
+  for(let i = warnings.length - 1; i >= 0; i--){
+    const wn = warnings[i];
+    wn.t -= dt;
+    if(wn.t <= 0){
+      cars.push({ lane: wn.lane, dir: wn.dir, len: wn.len, truck: wn.truck,
+        x: wn.dir === 1 ? -wn.len : W + wn.len, y: LANE_Y[wn.lane],
+        v: wn.v, color: wn.color });
+      warnings.splice(i, 1);
+    }
+  }
+
+  /* spawn cars */
+  for(let l = 0; l < 4; l++){
+    laneTimers[l] -= dt;
+    if(laneTimers[l] <= 0) spawnCar(l);
+  }
+
+  /* move cars */
+  for(let i = cars.length - 1; i >= 0; i--){
+    const c = cars[i];
+    c.x += c.v * c.dir * dt;
+    if((c.dir === 1 && c.x > W + 120) || (c.dir === -1 && c.x < -120)) cars.splice(i, 1);
+  }
+
+  if(state === S.DYING) return;
+
+  /* move walkers + collisions */
+  for(let i = walkers.length - 1; i >= 0; i--){
+    const wk = walkers[i];
+    if(wk.state === 'dead') continue;
+    wk.y -= WALK_SPEED * dt;
+    wk.wob += dt * 14;
+
+    if(wk.y <= EXIT_Y){
+      crossed++;
+      combo++; comboT = 1.6;
+      maxCombo = Math.max(maxCombo, combo);
+      const mult = Math.min(5, 1 + 0.25 * (combo - 1));
+      const gain = Math.round(10 * mult);
+      score += gain;
+      addPop(COLS[wk.col], EXIT_Y + 8, '+' + gain + (combo > 1 ? '  x' + combo : ''), '#ffe58a', combo > 1 ? 22 : 18);
+      burst(COLS[wk.col], EXIT_Y, 8, '#ffd166', 160);
+      if(combo > 1 && combo % 3 === 0){ sComboUp(); addPop(COLS[wk.col], EXIT_Y + 40, 'COMBO x' + combo, '#7fd4ff', 24); }
+      sCross(combo);
+      walkers.splice(i, 1);
+      continue;
+    }
+
+    /* car collision (AABB, small grace) */
+    let hit = false;
+    for(const c of cars){
+      const cw = c.truck ? 40 : 34;
+      if(Math.abs(wk.y - c.y) < CAR_H/2 + 10 - 4 && Math.abs(wk.x - c.x) < cw/2 + 7 - 4){ hit = true; break; }
+    }
+    if(hit){ die(wk); return; }
+
+    /* near miss: car front edge passes walker column within 30px while alive */
+    for(const c of cars){
+      if(Math.abs(wk.y - c.y) > CAR_H/2 + 26) continue;
+      if(Math.abs(wk.x - c.x) > 30) continue;
+      const key = wk.col + ':' + c.lane + ':' + Math.round(c.y) + ':' + Math.round(wk.x);
+      if(nearPairs.has(key)) continue;
+      // only when horizontally separated (not hit)
+      if(Math.abs(wk.x - c.x) > (c.truck ? 20 : 17) + 7){
+        nearPairs.add(key);
+        score += 5;
+        nearFlash = 1;
+        sNear();
+        addPop(wk.x, wk.y - 26, 'CLOSE +5', '#ffffff', 15);
+      }
+    }
+  }
+}
+
+/* ---------- draw ---------- */
+function rr(x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawCar(c){
+  const w = c.len, h = CAR_H;
+  const x = c.x - w/2, y = c.y - h/2;
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  rr(x + 3, y + 4, w, h, 9); ctx.fill();
+  ctx.fillStyle = c.color;
+  rr(x, y, w, h, 9); ctx.fill();
+  // windshield
+  ctx.fillStyle = 'rgba(20,24,34,0.75)';
+  const wx = c.dir === 1 ? x + w - 22 : x + 8;
+  rr(wx, y + 7, 14, h - 14, 4); ctx.fill();
+  // headlights
+  ctx.fillStyle = '#fff3c4';
+  const hx1 = c.dir === 1 ? x + w - 3 : x;
+  ctx.fillRect(hx1, y + 6, 3, 8);
+  ctx.fillRect(hx1, y + h - 14, 3, 8);
+  if(c.truck){ // cargo stripes
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    for(let i = 12; i < w - 14; i += 16) ctx.fillRect(x + i, y + 8, 6, h - 16);
+  }
+}
+
+function drawWalker(wk){
+  const bob = Math.sin(wk.wob) * 1.6;
+  const x = wk.x, y = wk.y + bob;
+  if(wk.state === 'dead'){
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(1.1);
+    ctx.fillStyle = SHIRT[0];
+    rr(-7, -10, 14, 20, 6); ctx.fill();
+    ctx.restore();
+    return;
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.beginPath(); ctx.ellipse(x, y + 11, 7, 3, 0, 0, 6.28); ctx.fill();
+  ctx.fillStyle = wk.shirt;
+  rr(x - 7, y - 9, 14, 20, 6); ctx.fill();
+  ctx.fillStyle = '#ffe0c2';
+  ctx.beginPath(); ctx.arc(x, y - 13, 6, 0, 6.28); ctx.fill();
+}
+
+function draw(){
+  ctx.save();
+  if(shake > 0) ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+
+  /* asphalt + sidewalks */
+  ctx.fillStyle = '#23262e'; ctx.fillRect(-20, -20, W+40, H+40);
+  ctx.fillStyle = '#2f333d'; ctx.fillRect(-20, 130, W+40, 540);          // road
+  ctx.fillStyle = '#39424a'; ctx.fillRect(-20, 118, W+40, 12);           // top curb
+  ctx.fillStyle = '#3a3f4a'; ctx.fillRect(-20, 668, W+40, 14);           // bottom curb
+  ctx.fillStyle = '#2b2f38'; ctx.fillRect(-20, 682, W+40, H-682+20);     // sidewalk
+
+  /* lane dashes */
+  ctx.strokeStyle = '#4a5060'; ctx.lineWidth = 4; ctx.setLineDash([26, 22]);
+  for(let l = 0; l < 3; l++){
+    const y = (LANE_Y[l] + LANE_Y[l+1]) / 2;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  /* crossing column guides (zebra hints) */
+  for(const cx of COLS){
+    ctx.fillStyle = 'rgba(242,193,78,0.08)';
+    ctx.fillRect(cx - 26, 130, 52, 538);
+    ctx.fillStyle = 'rgba(242,193,78,0.55)';
+    for(let zy = 692; zy > 140; zy -= 34) ctx.fillRect(cx - 20, zy, 40, 12);
+  }
+
+  /* exit line */
+  ctx.fillStyle = 'rgba(140,220,140,0.25)'; ctx.fillRect(0, EXIT_Y - 3, W, 3);
+
+  /* queue dots */
+  for(let cIdx = 0; cIdx < 3; cIdx++){
+    for(let q = 0; q < 3; q++){
+      const busy = walkers.some(wk => wk.col === cIdx && wk.y > SPAWN_Y - 34 - q*0);
+      ctx.fillStyle = (q === 0 && !busy) ? 'rgba(255,224,194,0.95)' : 'rgba(255,224,194,' + (0.75 - q*0.22) + ')';
+      ctx.beginPath(); ctx.arc(COLS[cIdx], 726 + q*22, 5, 0, 6.28); ctx.fill();
+    }
+  }
+
+  for(const c of cars) drawCar(c);
+
+  /* entrance telegraph glows */
+  for(const wn of warnings){
+    const gx = wn.dir === 1 ? 14 : W - 14;
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 45);
+    ctx.fillStyle = 'rgba(255,240,180,' + (0.35 + 0.45 * pulse) + ')';
+    ctx.beginPath(); ctx.arc(gx, LANE_Y[wn.lane], 8 + 4 * pulse, 0, 6.28); ctx.fill();
+    ctx.fillStyle = 'rgba(255,240,180,0.18)';
+    ctx.fillRect(wn.dir === 1 ? 0 : W - 4, LANE_Y[wn.lane] - CAR_H/2, 4, CAR_H);
+  }
+
+  for(const wk of walkers) drawWalker(wk);
+
+  /* particles */
+  for(const p of particles){
+    ctx.globalAlpha = Math.max(0, p.life * 2);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  /* floating text */
+  for(const p of pops){
+    ctx.globalAlpha = Math.min(1, p.life * 2.2);
+    ctx.fillStyle = p.col;
+    ctx.font = 'bold ' + p.size + 'px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(p.txt, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+
+  /* near-miss vignette */
+  if(nearFlash > 0){
+    ctx.strokeStyle = 'rgba(255,255,255,' + (nearFlash * 0.35) + ')';
+    ctx.lineWidth = 6; ctx.strokeRect(3, 3, W - 6, H - 6);
+  }
+
+  /* HUD */
+  if(state !== S.MENU){
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 30px system-ui, sans-serif';
+    ctx.fillText(String(score), 16, 46);
+    ctx.fillStyle = '#9aa2b1'; ctx.font = '14px system-ui, sans-serif';
+    ctx.fillText('BEST ' + best, 16, 68);
+    if(combo > 1){
+      ctx.fillStyle = '#ffd166'; ctx.font = 'bold 22px system-ui, sans-serif';
+      ctx.fillText('x' + combo, W - 70, 46);
+      // combo timer bar
+      ctx.fillStyle = 'rgba(255,209,102,0.25)'; ctx.fillRect(W - 70, 54, 56, 5);
+      ctx.fillStyle = '#ffd166'; ctx.fillRect(W - 70, 54, 56 * Math.max(0, comboT / 1.6), 5);
+    }
+  }
+
+  /* overlays */
+  if(state === S.MENU) drawMenu();
+  if(state === S.OVER) drawOver();
+
+  if(flash > 0){
+    ctx.fillStyle = 'rgba(255,90,80,' + (flash * 0.4) + ')';
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+  }
+  ctx.restore();
+}
+
+function drawMenu(){
+  ctx.fillStyle = 'rgba(15,17,22,0.72)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f2c14e'; ctx.font = 'bold 64px system-ui, sans-serif';
+  ctx.fillText('JAYWALK', W/2, 250);
+  ctx.fillStyle = '#c8cdd8'; ctx.font = '17px system-ui, sans-serif';
+  ctx.fillText('judge the gap · beat the rush', W/2, 288);
+  ctx.fillStyle = '#fff'; ctx.font = '19px system-ui, sans-serif';
+  ctx.fillText('Tap LEFT / MIDDLE / RIGHT', W/2, 380);
+  ctx.fillText('to send a pedestrian across', W/2, 406);
+  ctx.fillStyle = '#8bd450'; ctx.font = '15px system-ui, sans-serif';
+  ctx.fillText('chain crossings within 1.6s for combo multipliers', W/2, 452);
+  ctx.fillText('grazing a car pays +5… greed is a strategy', W/2, 478);
+  ctx.fillStyle = '#e94f4f'; ctx.font = '15px system-ui, sans-serif';
+  ctx.fillText('one hit ends the run', W/2, 516);
+  const pulse = 0.6 + 0.4 * Math.sin(Date.now() / 300);
+  ctx.fillStyle = 'rgba(255,255,255,' + pulse + ')'; ctx.font = 'bold 20px system-ui, sans-serif';
+  ctx.fillText('TAP TO START', W/2, 610);
+  ctx.fillStyle = '#9aa2b1'; ctx.font = '13px system-ui, sans-serif';
+  ctx.fillText('BEST ' + best + '  ·  BEST COMBO x' + bestCombo, W/2, 660);
+}
+
+function drawOver(){
+  ctx.fillStyle = 'rgba(15,17,22,0.72)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e94f4f'; ctx.font = 'bold 44px system-ui, sans-serif';
+  ctx.fillText('SPLAT!', W/2, 300);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 56px system-ui, sans-serif';
+  ctx.fillText(String(score), W/2, 380);
+  ctx.fillStyle = '#9aa2b1'; ctx.font = '16px system-ui, sans-serif';
+  ctx.fillText('BEST ' + best + (score >= best ? '  ★ NEW!' : ''), W/2, 412);
+  ctx.fillStyle = '#c8cdd8';
+  ctx.fillText('crossings ' + crossed + '   max combo x' + maxCombo, W/2, 448);
+  const pulse = 0.6 + 0.4 * Math.sin(Date.now() / 300);
+  ctx.fillStyle = 'rgba(255,255,255,' + pulse + ')'; ctx.font = 'bold 22px system-ui, sans-serif';
+  ctx.fillText('TAP TO RETRY', W/2, 540);
+}
+
+/* ---------- input ---------- */
+function press(x){
+  audio();
+  if(state === S.MENU){ reset(); state = S.PLAY; return; }
+  if(state === S.OVER){ reset(); state = S.PLAY; return; }
+  if(state === S.PLAY){
+    const col = x < W/3 ? 0 : (x < 2*W/3 ? 1 : 2);
+    dispatch(col);
+  }
+}
+function toGameX(clientX){
+  const r = cv.getBoundingClientRect();
+  return (clientX - r.left) / r.width * W;
+}
+cv.addEventListener('pointerdown', e => { e.preventDefault(); press(toGameX(e.clientX)); });
+
+/* ---------- autotest bot ---------- */
+let botOn = new URLSearchParams(location.search).has('autotest');
+let botTimer = 0;
+function laneArrivals(cIdx){
+  /* predicted times a car center crosses column x, per lane */
+  const col = COLS[cIdx], arr = [[],[],[],[]];
+  for(const c of cars){
+    if(c.lane < 0 || c.lane > 3) continue;
+    const passed = c.dir === 1 ? c.x > col + c.len/2 : c.x < col - c.len/2;
+    if(passed) continue;
+    const d = c.dir === 1 ? col - c.x : c.x - col;
+    arr[c.lane].push({ A: d / c.v, len: c.len, v: c.v });
+  }
+  for(const wn of warnings){
+    const d = wn.dir === 1 ? col + wn.len : W - col + wn.len;
+    arr[wn.lane].push({ A: wn.t + d / wn.v, len: wn.len, v: wn.v });
+  }
+  for(let l = 0; l < 4; l++){
+    const baseV = [110,150,190,230][l] * rampSpeed();
+    const d = laneTimers[l];
+    if(d > 0){
+      const dNear = Math.min(col, W - col) + 68;   // nearest possible entrance
+      arr[l].push({ A: d + 0.38 + dNear / baseV, len: 68, v: baseV, future: true });
+    }
+  }
+  return arr;
+}
+function botTick(dt){
+  if(state !== S.PLAY) return;
+  botTimer -= dt;
+  if(botTimer > 0) return;
+  botTimer = 0.1;
+  const activeCols = new Set(walkers.filter(wk => wk.state !== 'dead').map(wk => wk.col));
+  for(let cIdx = 0; cIdx < 3; cIdx++){
+    if(activeCols.has(cIdx)) continue;
+    const arrivals = laneArrivals(cIdx);
+    let safe = true;
+    for(let l = 0; l < 4; l++){
+      const tToLane = (SPAWN_Y - LANE_Y[l]) / WALK_SPEED;   // walker band center time
+      const band = (CAR_H/2 + 20) / WALK_SPEED;             // ± band half-life
+      for(const a of arrivals[l]){
+        const margin = (a.len/2 + 7) / a.v + 0.26;
+        if(Math.abs(a.A - tToLane) < margin + band){ safe = false; break; }
+      }
+      if(!safe) break;
+    }
+    if(safe && Math.random() > 0.04){ dispatch(cIdx); return; }
+  }
+}
+
+/* ---------- loop ---------- */
+let last = performance.now();
+let rafMode = !botOn;
+function loop(now){
+  let dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if(botOn) botTick(dt);
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* telemetry for headless tests */
+window.__causes = {};
+window.__deaths = 0;
+setInterval(() => {
+  document.title = 'st=' + ['MENU','PLAY','DYING','OVER'][state] +
+    ' sc=' + score + ' cb=' + combo + ' cr=' + cars.length + ' wk=' + walkers.length +
+    ' d=' + (window.__deaths||0) + ' x=' + crossed + ' t=' + Math.round(t);
+}, 300);
+</script>
+</body>
+</html>
