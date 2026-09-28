@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>PLATTER PANIC — spin to survive</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23ffb347'/></svg>">
+<style>
+html,body{margin:0;padding:0;height:100%;background:#141019;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;}
+#cv{display:block;margin:0 auto;touch-action:none;}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+"use strict";
+// ===== PLATTER PANIC — plate-spinning arcade (single file, no deps) =====
+const W=480,H=800;
+const cv=document.getElementById('cv'),g=cv.getContext('2d');
+function fit(){const s=Math.min(innerWidth/W,innerHeight/H);cv.width=W;cv.height=H;cv.style.width=W*s+'px';cv.style.height=H*s+'px';}
+addEventListener('resize',fit);fit();
+
+// rods: 4 zones at bottom, plate on each
+const RODN=4,RODW=W/RODN,RODY=560; // rod top y
+const FILL_RATE=55,FEVER_T=0.70;
+let S=null,shakes=0,parts=[],rings=[];
+let histBuf=[];
+
+function newPlate(){return{spin:100,speed:0,alive:true,respawn:0,ang:Math.random()*6.28};}
+function reset(){
+  S={mode:'menu',t:0,score:0,best:+(localStorage.getItem('platterBest')||0),
+     lives:3,rods:[],fever:0,feverCombo:0,storm:0,nextStorm:22,hold:[0,0,0,0],
+     lastAt:0,deadAt:0,causes:{},over:0,runBest:0};
+  for(let i=0;i<RODN;i++)S.rods.push(newPlate());
+}
+reset();
+
+function decayRate(t){return 6.0+t*0.085;} // per-plate %/s
+
+// ===== chunk B: update logic =====
+function zone(x){const r=cv.getBoundingClientRect();return Math.max(0,Math.min(RODN-1,Math.floor((x-r.left)/r.width*RODN)));}
+function die(cause){
+  S.lives--;S.causes[cause]=(S.causes[cause]||0)+1;shakes=14;
+  beep(110,0.28,'sawtooth',0.5);beep(70,0.4,'square',0.35);
+  for(let i=0;i<18;i++)parts.push({x:zoneCx(S.lastZone),y:RODY-38,vx:(Math.random()-0.5)*420,vy:-Math.random()*380-60,l:0.9,c:'#ff5a5a',r:3+Math.random()*3});
+  if(S.lives<=0){
+    S.mode='over';S.over=1;S.deadAt=performance.now();
+    if(S.score>S.best){S.best=S.score;localStorage.setItem('platterBest',S.best);}
+  }else{S.rods[S.lastZone].alive=false;S.rods[S.lastZone].respawn=2.5;}
+}
+function zoneCx(i){return RODW*i+RODW/2;}
+function update(dt){
+  if(S.mode!=='play'){
+    // menu / over: gentle idle spin
+    S.rods.forEach(r=>{if(r.alive){r.spin=100;r.ang+=dt*3;}});
+    return;
+  }
+  S.t+=dt;
+  // score: time + fever combo ticks
+  const dr=decayRate(S.t)*(S.storm>0?2.2:1);
+  let full=true,aliveN=0;
+  for(let i=0;i<RODN;i++){
+    const p=S.rods[i];
+    if(!p.alive){p.respawn-=dt;if(p.respawn<=0){p.alive=true;p.spin=80;}continue;}
+    aliveN++;
+    p.speed=S.hold[i]?FILL_RATE:-dr;
+    p.spin=Math.max(0,Math.min(100,p.spin+p.speed*dt));
+    p.ang+=dt*(1+p.spin*0.28);
+    if(p.spin<FEVER_T)full=false;
+    if(p.spin<=0){S.lastZone=i;die('drop');if(S.mode!=='play')return;}
+  }
+  // fever
+  if(full&&aliveN===RODN){S.fever=Math.min(1,S.fever+dt*2);S.feverCombo+=dt*3;}
+  else S.fever=Math.max(0,S.fever-dt*3);
+  if(S.fever>0.9){S.score+=dt*60*(S.feverCombo>1?2:1);}else S.score+=dt*10;
+  // storm event
+  S.storm=Math.max(0,S.storm-dt);
+  if(S.t>S.nextStorm){S.storm=4;S.nextStorm=S.t+18+Math.random()*10;beep(60,0.5,'square',0.4);}
+  // score int
+  S.disp=Math.floor(S.score);
+  // particles physics
+  for(let i=parts.length-1;i>=0;i--){const p=parts[i];p.l-=dt*1.1;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=900*dt;if(p.l<=0)parts.splice(i,1);}
+  // warn beep for lowest plate
+  const low=Math.min(...S.rods.filter(r=>r.alive).map(r=>r.spin));
+  warnT-=dt;
+  if(low<32&&warnT<=0){beep(880,0.06,'sine',0.08);warnT=0.25;}
+  // telemetry ring buffer
+  histBuf.push([S.t,S.rods.map(r=>r.alive?r.spin:-1),S.lives]);
+  if(histBuf.length>400)histBuf.shift();
+}
+
+// ===== chunk C: audio =====
+let AC=null,warnT=0;
+function ac(){if(!AC)AC=new (window.AudioContext||window.webkitAudioContext)();return AC;}
+function beep(f,d,type,vol){
+  try{const a=ac(),o=a.createOscillator(),gn=a.createGain();
+  o.type=type||'sine';o.frequency.value=f;
+  gn.gain.setValueAtTime(vol||0.2,a.currentTime);
+  gn.gain.exponentialRampToValueAtTime(0.001,a.currentTime+d);
+  o.connect(gn);gn.connect(a.destination);o.start();o.stop(a.currentTime+d);}catch(e){}
+}
+function ding(n){beep(660+n*110,0.09,'triangle',0.18);}
+
+// ===== chunk D: render =====
+function draw(){
+  g.save();
+  g.fillStyle='#141019';g.fillRect(0,0,W,H);
+  if(shakes>0){shakes*=0.88;if(shakes<0.5)shakes=0;g.translate((Math.random()-0.5)*shakes,(Math.random()-0.5)*shakes);}
+  // stage poles
+  for(let i=0;i<RODN;i++){
+    const cx=zoneCx(i);
+    g.strokeStyle='#3a3350';g.lineWidth=10;
+    g.beginPath();g.moveTo(cx,RODY);g.lineTo(cx,RODY+120);g.stroke();
+    // zone tint when held
+    if(S.hold[i]){g.fillStyle='rgba(120,220,255,0.07)';g.fillRect(i*RODW,0,RODW,RODY+140);}
+  }
+  // storm overlay
+  if(S.storm>0){g.fillStyle='rgba(255,90,90,'+(0.05+0.04*Math.sin(S.t*10))+')';g.fillRect(0,0,W,H);}
+  // plates
+  for(let i=0;i<RODN;i++){
+    const p=S.rods[i],cx=zoneCx(i);
+    if(!p.alive){
+      g.fillStyle='#665f7d';g.font='20px monospace';g.textAlign='center';
+      g.fillText('new in '+p.respawn.toFixed(1),cx,RODY+40);
+      continue;
+    }
+    const wob=p.spin<30?Math.sin(S.t*30+i)*p.spin*0.25:0;
+    const py=RODY-8;
+    g.save();g.translate(cx,py);g.rotate(wob*0.02);
+    // plate: ellipse, color by spin
+    const c=p.spin>FEVER_T?'#7bffb2':(p.spin>30?'#ffd479':'#ff5a5a');
+    g.fillStyle=c;
+    g.beginPath();g.ellipse(0,0,64,15,0,0,7);g.fill();
+    g.fillStyle='rgba(255,255,255,0.85)';
+    g.beginPath();g.ellipse(0,-4,40,8,0,0,7);g.fill();
+    // spin marker
+    g.fillStyle='#141019';
+    g.beginPath();g.ellipse(Math.cos(p.ang)*30,-4+Math.sin(p.ang)*4,6,3,p.ang,0,7);g.fill();
+    g.restore();
+    // spin bar
+    g.fillStyle='#2a2440';g.fillRect(cx-45,RODY+150-0+38,90,10);
+    g.fillStyle=c;g.fillRect(cx-45,RODY+188,90*p.spin/100,10);
+    if(S.hold[i]){g.strokeStyle='#7bdcff';g.lineWidth=3;g.strokeRect(cx-47,RODY+186,94,14);}
+  }
+  // fever banner
+  if(S.fever>0.85){g.fillStyle='rgba(123,255,178,'+(0.12+0.06*Math.sin(S.t*14))+')';g.fillRect(0,0,W,H);
+    g.fillStyle='#7bffb2';g.font='bold 30px monospace';g.textAlign='center';g.fillText('FEVER ×2',W/2,120);}
+  if(S.storm>0){g.fillStyle='#ff5a5a';g.font='bold 26px monospace';g.textAlign='center';g.fillText('STORM!',W/2,160);}
+  // particles
+  parts.forEach(p=>{g.globalAlpha=Math.max(0,p.l);g.fillStyle=p.c;g.beginPath();g.arc(p.x,p.y,p.r,0,7);g.fill();});
+  g.globalAlpha=1;
+  drawHUD();
+  g.restore();
+}
+function drawHUD(){
+  g.textAlign='center';
+  if(S.mode==='menu'){
+    g.fillStyle='#ffb347';g.font='bold 52px monospace';g.fillText('PLATTER PANIC',W/2,210);
+    g.fillStyle='#cfc8e8';g.font='22px monospace';
+    g.fillText('Keep every plate spinning.',W/2,290);
+    g.fillText('Hold a column to speed its plate up.',W/2,325);
+    g.fillText('Multi-touch: save two at once.',W/2,360);
+    g.fillText('If all plates pass 70% → FEVER ×2',W/2,395);
+    g.fillStyle='#7bdcff';g.font='26px monospace';
+    g.fillText('TAP TO START',W/2,490+40*Math.sin(S.t*4));
+    g.fillStyle='#8f87ad';g.font='18px monospace';g.fillText('BEST '+S.best,W/2,620);
+  }else if(S.mode==='over'){
+    g.fillStyle='rgba(10,8,16,0.72)';g.fillRect(0,140,W,340);
+    g.fillStyle='#ff5a5a';g.font='bold 44px monospace';g.fillText('ALL PLATES DOWN',W/2,230);
+    g.fillStyle='#fff';g.font='34px monospace';g.fillText('SCORE '+S.disp,W/2,300);
+    g.fillStyle='#ffb347';g.font='24px monospace';g.fillText('BEST '+S.best+(S.disp>=S.best?' ★NEW!':''),W/2,345);
+    g.fillStyle='#7bdcff';g.font='24px monospace';g.fillText('TAP TO RETRY',W/2,430);
+  }else{
+    g.fillStyle='#fff';g.font='bold 40px monospace';g.fillText(String(S.disp),W/2,90);
+    g.fillStyle='#8f87ad';g.font='18px monospace';g.fillText('BEST '+S.best,W/2,122);
+    // lives
+    for(let i=0;i<3;i++){
+      g.fillStyle=i<S.lives?'#7bffb2':'#3a3350';
+      g.beginPath();g.arc(40+i*28,60,9,0,7);g.fill();
+    }
+    // time
+    g.fillStyle='#8f87ad';g.font='18px monospace';g.textAlign='right';
+    g.fillText(S.t.toFixed(0)+'s',W-24,66);g.textAlign='center';
+  }
+}
+
+let last=0;
+function loop(ts){
+  const dt=Math.min(0.05,(ts-last)/1000||0.016);last=ts;
+  update(dt);draw();
+  if(!AUTO)requestAnimationFrame(loop);
+}
+const AUTO=/autotest/.test(location.search);
+let botMissUntil=-1;
+if(AUTO){
+  // bot: hold two lowest-spin plates (simulated multi-touch); 5% chance of an
+  // 800ms "human slip" window where only one plate gets saved
+  setInterval(()=>{
+    try{
+      if(S.mode==='menu'){startRun();return;}
+      if(S.mode==='over'){if(performance.now()-S.deadAt>800){const b=S.best;reset();S.best=b;S.mode='play';}return;}
+      if(S.t<0.5)botMissUntil=-1;
+      if(S.t>botMissUntil&&Math.random()<0.006)botMissUntil=S.t+0.8;
+      const idx=S.rods.map((r,i)=>({i,sp:r.alive?r.spin:999})).sort((a,b)=>a.sp-b.sp);
+      S.hold=[0,0,0,0];
+      const nSave=(S.t<botMissUntil)?1:2;
+      for(let k=0;k<Math.min(nSave,idx.length);k++)if(idx[k].sp<999)S.hold[idx[k].i]=1;
+    }catch(e){window.__botErr=String(e&&e.stack||e);}
+  },100);
+  setInterval(()=>{document.title='st='+S.mode+' sc='+S.disp+' lv='+S.lives+' low='+Math.min(...S.rods.map(r=>r.alive?r.spin:999)).toFixed(0)+' t='+S.t.toFixed(1)+' err='+String(window.__botErr||'');},200);
+  setInterval(ts=>loop(performance.now()),16);
+}else requestAnimationFrame(loop);
+
+// ===== chunk E: input =====
+function press(x,y){
+  try{ac().resume();}catch(e){}
+  const z=zone(x);
+  if(S.mode==='menu'){startRun();return;}
+  if(S.mode==='over'){if(performance.now()-S.deadAt>600){reset();startRun();}return;}
+  if(S.hold[z])return;
+  S.hold[z]=1;beep(340+z*70,0.05,'square',0.06);
+}
+function release(x){const z=zone(x);S.hold[z]=0;}
+function startRun(){
+  const best=S.best;const causes=S.causes;
+  reset();S.mode='play';S.best=best;S.causes=causes;
+  beep(520,0.08,'triangle',0.2);beep(780,0.1,'triangle',0.2);
+}
+addEventListener('pointerdown',e=>{e.preventDefault();press(e.clientX,e.clientY);ptrs.set(e.pointerId,zone(e.clientX));},{passive:false});
+addEventListener('pointerup',e=>{
+  const z=ptrs.get(e.pointerId);ptrs.delete(e.pointerId);
+  if(z!==undefined&&![...ptrs.values()].includes(z))release(e.clientX);
+},{passive:false});
+addEventListener('pointercancel',e=>{const z=ptrs.get(e.pointerId);ptrs.delete(e.pointerId);if(z!==undefined&&![...ptrs.values()].includes(z))release(e.clientX);},{passive:false});
+const ptrs=new Map();
+addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();press(cv.getBoundingClientRect().left+W/2,0);}});
+addEventListener('keyup',e=>{if(e.code==='Space')release(0);});
+Object.defineProperty(window,'PLATTER',{get:()=>S,configurable:true});
+
+</script>
+</body>
+</html>
