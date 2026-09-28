@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>贪坡 GREEDY SLOPE</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0d0d15;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+  canvas{display:block;margin:0 auto}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+"use strict";
+/* ============================================================
+   贪坡 GREEDY SLOPE — push-your-luck 斜坡赌狗
+   小球自动滚过金色赌档：档内倍率自动攀升，点按=收手入袋；
+   每档有隐藏爆点，贪过爆点=炸。前 2 档有护盾（碎了不死）。
+   ============================================================ */
+const W = 480, H = 800;
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const AUTOTEST = /autotest/.test(location.search);
+
+function fit(){
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = W * s * dpr; cv.height = H * s * dpr;
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+}
+addEventListener('resize', fit); fit();
+
+/* ---------------- WebAudio 合成音效（无音频文件） ---------------- */
+let AC = null, master = null;
+function audio(){
+  if (AC) return AC;
+  try{
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = 0.5; master.connect(AC.destination);
+  }catch(e){ AC = null; }
+  return AC;
+}
+function tone(f, dur, type, vol, delay, slideTo){
+  if (!AC) return;
+  try{
+    const o = AC.createOscillator(), g = AC.createGain(), t = AC.currentTime + (delay || 0);
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + 0.03);
+  }catch(e){}
+}
+function sTick(m){ tone(170 + m * 22, 0.05, 'square', 0.09); }
+function sUi(){ tone(660, 0.06, 'triangle', 0.14); }
+function sCollect(m){
+  const k = 1 + Math.min(m, 12) * 0.03;
+  [540, 810, 1215].forEach((f, i) => tone(f * k, 0.1, 'triangle', 0.16, i * 0.06));
+}
+function sClang(){ tone(175, 0.18, 'square', 0.2, 0, 120); tone(262, 0.22, 'square', 0.16, 0.02, 180); }
+function sBoom(){
+  if (!AC) return;
+  try{
+    const t = AC.currentTime, len = 0.5,
+          buf = AC.createBuffer(1, AC.sampleRate * len | 0, AC.sampleRate),
+          d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 2);
+    const src = AC.createBufferSource(); src.buffer = buf;
+    const f = AC.createBiquadFilter(); f.type = 'lowpass';
+    f.frequency.setValueAtTime(900, t); f.frequency.exponentialRampToValueAtTime(80, t + len);
+    const g = AC.createGain(); g.gain.setValueAtTime(0.7, t); g.gain.exponentialRampToValueAtTime(0.001, t + len);
+    src.connect(f); f.connect(g); g.connect(master); src.start(t);
+    tone(120, 0.5, 'sine', 0.5, 0, 38);
+  }catch(e){}
+}
+
+/* ---------------- 全局状态 ---------------- */
+const S = {
+  st: 'title',            // title | run | gate | launch | dead
+  t: 0, n: 0, score: 0, runM: 0,
+  best: +(localStorage.getItem('gs_best') || 0),
+  bestM: +(localStorage.getItem('gs_bestm') || 0),
+  deathM: 0, deaths: 0,
+  gate: null, nextIn: 2.0, worldX: 0,
+  launchT: 0, shake: 0, flash: 0, lock: 0, trailT: 0
+};
+let lastB = [9, 9];       // 最近两档爆点（保底伪随机用）
+let aiTh = 2.2;           // autotest AI 收手阈值
+
+/* ---------------- 粒子 / 浮字 ---------------- */
+const parts = [], floats = [];
+function addPart(x, y, vx, vy, g, life, col, sz){
+  if (parts.length > 420) return;
+  parts.push({ x, y, vx, vy, g, life, decay: 1 / life, col, sz });
+}
+function addFloat(txt, x, y, col, size){
+  floats.push({ txt, x, y, life: 1, col, size: size || 26 });
+}
+function updFx(dt){
+  for (let i = parts.length - 1; i >= 0; i--){
+    const p = parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.life -= p.decay * dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  for (let i = floats.length - 1; i >= 0; i--){
+    const f = floats[i];
+    f.y -= 44 * dt; f.life -= 0.9 * dt;
+    if (f.life <= 0) floats.splice(i, 1);
+  }
+}
+
+/* ---------------- 爆点分布（保底伪随机） ----------------
+   55% → 1.6-3.8 ｜ 30% → 3.8-8.0 ｜ 15% → 8.0-12.5
+   连续两档爆点都 <2 时强制重掷一次，压制「运气差」的挫败 */
+function rollBurst(){
+  const roll = () => {
+    const u = Math.random();
+    if (u < 0.55) return 1.6 + (u / 0.55) * 2.2;
+    if (u < 0.85) return 3.8 + ((u - 0.55) / 0.30) * 4.2;
+    return 8.0 + ((u - 0.85) / 0.15) * 4.5;
+  };
+  let b = roll();
+  if (lastB[0] < 2 && lastB[1] < 2 && b < 2) b = roll();
+  lastB = [lastB[1], b];
+  return b;
+}
+function gateGap(){ return Math.max(1.8, 2.4 + Math.random() * 1.8 - S.n * 0.035); }
+function runSpeed(){ return 160 + 14 * Math.sqrt(S.t); }
+
+/* ---------------- 状态流转 ---------------- */
+function startRun(){
+  S.st = 'run'; S.t = 0; S.n = 0; S.score = 0; S.runM = 0;
+  S.worldX = 0; S.nextIn = 2.0; S.gate = null;
+  lastB = [9, 9]; parts.length = 0; floats.length = 0;
+}
+function enterGate(){
+  S.gate = { n: S.n, T: 0, m: 1, b: rollBurst(), shield: S.n < 2, animT: 0, tickT: 0.2, pulse: 0 };
+  S.st = 'gate'; sUi();
+  if (AUTOTEST){
+    aiTh = S.n < 2 ? 2.2 : (S.n < 4 ? 2.2 + Math.random() * 3 : (Math.random() < 0.5 ? 99 : 2.5 + Math.random() * 2));
+  }
+}
+function endGate(){
+  S.st = 'launch'; S.launchT = 0; S.gate = null; S.n++;
+  if (S.score > S.best){ S.best = S.score; localStorage.setItem('gs_best', S.best); }
+}
+function collect(){
+  const g = S.gate;
+  if (!g || g.animT < 0.22) return;
+  const m = g.m, pts = Math.round(m * 100);
+  S.score += pts;
+  S.runM = Math.max(S.runM, m);
+  addFloat('+' + pts, 240, 380, '#ffc93c', 30);
+  addFloat(m < 1.8 ? '稳！' : m < 4 ? '漂亮！' : m < 8 ? '贪婪！' : '疯了！！', 240, 330,
+    m < 4 ? '#7de8ff' : '#ff8c3c', m < 8 ? 26 : 34);
+  for (let i = 0; i < 26; i++)
+    addPart(150, 520, (Math.random() - 0.5) * 320, -80 - Math.random() * 300, 640, 0.5 + Math.random() * 0.4, '#ffc93c', 3 + Math.random() * 3);
+  sCollect(m);
+  endGate();
+}
+function shieldBreak(){
+  const g = S.gate, bank = g.m * 0.5, pts = Math.round(bank * 100);
+  S.score += pts; S.runM = Math.max(S.runM, bank);
+  addFloat('护盾碎！保底 +' + pts, 240, 380, '#ff6b6b', 26);
+  for (let i = 0; i < 30; i++)
+    addPart(150, 520, (Math.random() - 0.5) * 420, (Math.random() - 0.5) * 420, 400, 0.5, '#9aa4ff', 3);
+  sClang(); S.shake = 9; S.flash = 0.35;
+  endGate();
+}
+function die(){
+  const g = S.gate;
+  S.deathM = g.m; S.deaths++;
+  if (S.runM > S.bestM){ S.bestM = S.runM; localStorage.setItem('gs_bestm', S.bestM); }
+  if (S.score > S.best){ S.best = S.score; localStorage.setItem('gs_best', S.best); }
+  S.st = 'dead'; S.lock = 0.45; S.shake = 22; S.flash = 1;
+  for (let i = 0; i < 70; i++){
+    const a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 380;
+    addPart(150, 520, Math.cos(a) * sp, Math.sin(a) * sp - 120, 700, 0.5 + Math.random() * 0.5,
+      ['#ffc93c', '#ff8c3c', '#ff4d4d', '#ffffff'][i % 4], 3 + Math.random() * 4);
+  }
+  sBoom();
+}
+
+/* ---------------- 输入 ---------------- */
+function press(){
+  audio();
+  if (AC && AC.state === 'suspended') AC.resume();
+  if (S.st === 'title'){ startRun(); sUi(); return; }
+  if (S.st === 'gate'){ collect(); return; }
+  if (S.st === 'dead' && S.lock <= 0){ startRun(); sUi(); return; }
+}
+cv.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'Enter'){ e.preventDefault(); press(); }
+});
+addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------------- 主循环 ---------------- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+function step(dt){
+  S.lock = Math.max(0, S.lock - dt);
+  S.shake = Math.max(0, S.shake - 60 * dt);
+  S.flash = Math.max(0, S.flash - 2.2 * dt);
+  updFx(dt);
+  if (S.st === 'run'){
+    S.t += dt;
+    S.worldX += runSpeed() * dt;
+    S.nextIn -= dt;
+    S.trailT -= dt;
+    if (S.trailT <= 0){
+      S.trailT = 0.04;
+      addPart(138, 640, -60 - Math.random() * 40, (Math.random() - 0.5) * 30, 0, 0.4, 'rgba(255,255,255,0.3)', 4);
+    }
+    if (S.nextIn <= 0) enterGate();
+  } else if (S.st === 'gate'){
+    const g = S.gate;
+    S.worldX += runSpeed() * 0.35 * dt;   // 子弹时间
+    g.animT += dt;
+    if (g.pulse > 0) g.pulse = Math.max(0, g.pulse - 3.5 * dt);
+    if (g.animT > 0.22){
+      g.T += dt * (1 + 0.03 * g.n);       // 后期档倍率涨速略增
+      g.m = 1 + 0.55 * g.T + 0.075 * g.T * g.T;
+      g.tickT -= dt;
+      if (g.tickT <= 0){
+        g.tickT = clamp(0.5 - g.m * 0.022, 0.13, 0.5);
+        g.pulse = 1; sTick(g.m);
+      }
+      if (g.m >= g.b){
+        if (g.shield) shieldBreak(); else die();
+      }
+    }
+  } else if (S.st === 'launch'){
+    S.launchT += dt;
+    S.worldX += runSpeed() * 1.4 * dt;
+    if (S.launchT >= 0.55){ S.st = 'run'; S.nextIn = gateGap(); }
+  }
+}
+
+/* ---------------- 渲染 ---------------- */
+function easeOut(p){ return 1 - (1 - p) * (1 - p); }
+function render(){
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d0d15'; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  if (S.shake > 0) ctx.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
+
+  /* 远景速度线 */
+  const off2 = -(S.worldX * 0.5 % 130);
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 3;
+  for (let x = off2; x < W + 130; x += 130){
+    for (let r = 0; r < 3; r++){
+      const y = 150 + r * 150;
+      ctx.beginPath(); ctx.moveTo(x + 55, y); ctx.lineTo(x, y + 46); ctx.stroke();
+    }
+  }
+  /* 斜坡地面 + 斜条纹 */
+  ctx.fillStyle = '#141422'; ctx.fillRect(0, 690, W, H - 690);
+  ctx.strokeStyle = '#232338'; ctx.lineWidth = 10;
+  const off = -(S.worldX % 80);
+  for (let x = off; x < W + 80; x += 80){
+    ctx.beginPath(); ctx.moveTo(x + 26, H); ctx.lineTo(x + 86, 690); ctx.stroke();
+  }
+  ctx.strokeStyle = '#3a3a58'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, 690); ctx.lineTo(W, 690); ctx.stroke();
+
+  /* 粒子 */
+  for (const p of parts){
+    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(p.x - p.sz / 2, p.y - p.sz / 2, p.sz, p.sz);
+  }
+  ctx.globalAlpha = 1;
+
+  /* 球位置（gate 内上浮进环） */
+  let bx = 150, by = 640;
+  if (S.st === 'gate' && S.gate){
+    const p = clamp(S.gate.animT / 0.22, 0, 1);
+    by = 640 - 120 * easeOut(p);
+  } else if (S.st === 'launch'){
+    const p = clamp(S.launchT / 0.55, 0, 1);
+    by = 640 - 130 * 4 * p * (1 - p);
+  }
+
+  /* 赌档金环 */
+  if (S.st === 'gate' && S.gate){
+    const g = S.gate, r = Math.min(g.m / 6, 1),
+          col = 'hsl(' + (48 - 46 * r) + ',100%,60%)';
+    const gr = ctx.createRadialGradient(bx, by, 40, bx, by, 260);
+    gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = gr; ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.strokeStyle = col; ctx.lineWidth = 7;
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath(); ctx.arc(0, 0, 118 + g.pulse * 7, 0, Math.PI * 2); ctx.stroke();
+    const rot = S.worldX * 0.012;
+    for (let i = 0; i < 12; i++){
+      const a = rot + i * Math.PI / 6;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * 128, Math.sin(a) * 128);
+      ctx.lineTo(Math.cos(a) * 140, Math.sin(a) * 140);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1; ctx.restore();
+    /* 倍率大数字 */
+    const sc = 1 + 0.3 * g.pulse;
+    ctx.save();
+    ctx.translate(240, 290); ctx.scale(sc, sc);
+    ctx.font = '800 68px system-ui,sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = col;
+    ctx.fillText('×' + g.m.toFixed(1), 0, 0);
+    ctx.restore();
+    ctx.font = '600 22px system-ui,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.5 + 0.4 * g.pulse) + ')';
+    ctx.fillText('点按收手', 240, 350);
+    if (g.shield){
+      ctx.fillStyle = '#9aa4ff'; ctx.font = '600 18px system-ui,sans-serif';
+      ctx.fillText('🛡 护盾中 · 炸了也不死', 240, 640);
+    }
+    if (g.m > 4){
+      ctx.strokeStyle = 'rgba(255,60,60,' + (0.12 + 0.18 * g.pulse) + ')';
+      ctx.lineWidth = 26; ctx.strokeRect(0, 0, W, H);
+    }
+  }
+
+  /* 球 */
+  ctx.save();
+  if (S.st === 'gate'){ ctx.shadowColor = '#ffc93c'; ctx.shadowBlur = 20; }
+  ctx.fillStyle = '#f5f6fa';
+  ctx.beginPath(); ctx.arc(bx, by, 15, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  /* 浮字 */
+  for (const f of floats){
+    ctx.globalAlpha = clamp(f.life, 0, 1);
+    ctx.fillStyle = f.col;
+    ctx.font = '800 ' + f.size + 'px system-ui,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(f.txt, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  /* HUD */
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#f5f6fa'; ctx.font = '800 44px system-ui,sans-serif';
+  ctx.fillText(String(S.score), 24, 22);
+  ctx.fillStyle = '#8b8ba6'; ctx.font = '600 18px system-ui,sans-serif';
+  ctx.fillText('第 ' + (S.n + 1) + ' 档', 24, 76);
+  ctx.textAlign = 'right';
+  ctx.fillText('最高 ' + S.best, W - 24, 22);
+  ctx.fillText('最高倍率 ×' + S.bestM.toFixed(1), W - 24, 50);
+  ctx.textBaseline = 'alphabetic';
+
+  /* 遮罩界面 */
+  if (S.st === 'title'){
+    ctx.fillStyle = 'rgba(10,10,18,0.82)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffc93c'; ctx.font = '900 96px system-ui,sans-serif';
+    ctx.fillText('贪 坡', 240, 250);
+    ctx.fillStyle = '#8b8ba6'; ctx.font = '700 26px system-ui,sans-serif';
+    ctx.fillText('G R E E D Y   S L O P E', 240, 300);
+    ctx.fillStyle = '#c9c9de'; ctx.font = '600 22px system-ui,sans-serif';
+    ctx.fillText('小球自动滚下斜坡，穿过金色赌档', 240, 420);
+    ctx.fillText('档内倍率疯涨，点按 = 收手入袋', 240, 456);
+    ctx.fillText('贪过隐藏爆点 = 当场爆炸', 240, 492);
+    ctx.fillStyle = '#9aa4ff';
+    ctx.fillText('前 2 档有护盾 · 炸了也不死', 240, 540);
+    ctx.fillStyle = '#8b8ba6'; ctx.font = '600 19px system-ui,sans-serif';
+    ctx.fillText('最高分 ' + S.best + ' ｜ 最高倍率 ×' + S.bestM.toFixed(1), 240, 600);
+    ctx.fillStyle = '#ffc93c'; ctx.font = '800 30px system-ui,sans-serif';
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(performance.now() / 300);
+    ctx.fillText('— 点按开始 —', 240, 680);
+    ctx.globalAlpha = 1;
+  } else if (S.st === 'dead'){
+    ctx.fillStyle = 'rgba(10,10,18,0.78)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff4d4d'; ctx.font = '900 58px system-ui,sans-serif';
+    ctx.fillText('贪爆 ×' + S.deathM.toFixed(1), 240, 260);
+    ctx.fillStyle = '#c9c9de'; ctx.font = '600 24px system-ui,sans-serif';
+    ctx.fillText('第 ' + (S.n + 1) + ' 档 · 共 ' + S.deaths + ' 次贪爆', 240, 312);
+    ctx.fillStyle = '#f5f6fa'; ctx.font = '800 52px system-ui,sans-serif';
+    ctx.fillText(String(S.score), 240, 410);
+    ctx.fillStyle = '#8b8ba6'; ctx.font = '600 20px system-ui,sans-serif';
+    ctx.fillText('本局得分', 240, 438);
+    ctx.fillStyle = '#c9c9de'; ctx.font = '600 22px system-ui,sans-serif';
+    ctx.fillText('本局最高倍率 ×' + S.runM.toFixed(1) + ' ｜ 历史最高 ×' + S.bestM.toFixed(1), 240, 510);
+    ctx.fillStyle = '#8b8ba6'; ctx.font = '600 19px system-ui,sans-serif';
+    ctx.fillText('最高分 ' + S.best, 240, 550);
+    if (S.lock <= 0){
+      ctx.fillStyle = '#ffc93c'; ctx.font = '800 30px system-ui,sans-serif';
+      ctx.globalAlpha = 0.6 + 0.4 * Math.sin(performance.now() / 200);
+      ctx.fillText('▶ 点按再来一局', 240, 650);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#5b5b74'; ctx.font = '500 16px system-ui,sans-serif';
+      ctx.fillText('重开 <0.5s · 这次见好就收？', 240, 690);
+    }
+  }
+  ctx.restore();
+
+  if (S.flash > 0){
+    ctx.fillStyle = 'rgba(255,255,255,' + (S.flash * 0.55) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+/* ---------------- 启动 ---------------- */
+const SHOT = (location.search.match(/shot=(\w+)/) || [])[1];
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  step(dt); render();
+  requestAnimationFrame(frame);
+}
+if (SHOT){
+  /* 确定性截图钩子：load 时构造状态同步渲染一帧（此 chromium 截图发生在 load 瞬间） */
+  startRun();
+  if (SHOT === 'gate'){
+    enterGate();
+    S.gate.animT = 1; S.gate.T = 2.6; S.gate.b = 99; S.gate.pulse = 0.8;
+    S.gate.m = 1 + 0.55 * 2.6 + 0.075 * 2.6 * 2.6;   // ≈3.63
+    S.score = 640; S.best = 1240; S.bestM = 6.8;
+  } else if (SHOT === 'dead'){
+    S.st = 'dead'; S.gate = null; S.lock = 0;
+    S.score = 1240; S.runM = 6.8; S.deathM = 8.3; S.n = 6; S.deaths = 3;
+    S.best = 1240; S.bestM = 6.8;
+  }
+  render();
+  requestAnimationFrame(frame);   // 持续重绘同一状态，让合成器有帧可截
+} else if (AUTOTEST){
+  /* 无头自测：setInterval 驱动（虚拟时间下 rAF 停摆）+ AI 自动玩 + title 遥测 */
+  setInterval(() => { step(1 / 60); render(); }, 16);
+  setInterval(() => {
+    document.title = 'st=' + S.st + ' sc=' + S.score + ' n=' + S.n +
+      ' m=' + (S.gate ? S.gate.m.toFixed(2) : '-') +
+      ' b=' + (S.gate ? S.gate.b.toFixed(2) : '-') +
+      ' dm=' + (S.deathM ? S.deathM.toFixed(1) : '-') +
+      ' deaths=' + S.deaths + ' best=' + S.best + ' bestM=' + S.bestM.toFixed(1);
+  }, 700);
+  setInterval(() => {
+    if (S.st === 'title') press();
+    else if (S.st === 'gate' && S.gate && S.gate.m >= aiTh) press();
+    else if (S.st === 'dead' && S.lock <= 0) press();
+  }, 100);
+} else {
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
