@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>LIGHTKEEP — hold the beam</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%23ffd166'/></svg>">
+<style>
+html,body{margin:0;padding:0;background:#060913;height:100%;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv" width="480" height="800"></canvas></div>
+<script>
+'use strict';
+/* LIGHTKEEP — rotate the lighthouse beam, charge passing ships, dodge the kraken. */
+const cv=document.getElementById('cv'),X=cv.getContext('2d');
+const W=480,H=800,LX=58,LY=430;          // canvas + lighthouse pos
+const SEA_T=150,SEA_B=690;               // sea band
+let S=null;                              // game state (getter-exported)
+let best=+(localStorage.getItem('lk_best')||0);
+let audioOn=true;
+
+function reset(){
+  S={mode:'menu',t:0,score:0,hearts:3,combo:0,comboT:0,
+     ang:-Math.PI*0.5,beamW:0,               // beam angle + angular velocity
+     ships:[],monsters:[],parts:[],waves:[],
+     shipT:1.2,monT:0,shake:0,flash:0,
+     chargeId:-1,chargeT:0,chargeP:0,        // current charging ship
+     angerT:-1,angerP:0,                     // current angered monster
+     overAt:0,deathCause:''};
+}
+Object.defineProperty(window,'LIGHTKEEP',{get:()=>S,configurable:true});
+
+/* ---------- helpers ---------- */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const angDiff=(a,b)=>{let d=(b-a)%(Math.PI*2);if(d>Math.PI)d-=Math.PI*2;if(d<-Math.PI)d+=Math.PI*2;return d;};
+
+/* ---------- audio (WebAudio synth, no files) ---------- */
+let AC=null;
+function ac(){if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){audioOn=false;}}return AC;}
+function beep(f,dur,type,vol,slide){
+  if(!audioOn)return;const a=ac();if(!a)return;
+  const o=a.createOscillator(),g=a.createGain(),t=a.currentTime;
+  o.type=type||'sine';o.frequency.setValueAtTime(f,t);
+  if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide),t+dur);
+  g.gain.setValueAtTime(vol||0.08,t);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g).connect(a.destination);o.start(t);o.stop(t+dur+0.02);
+}
+const sfx={
+  tick:p=>beep(300+p*500,0.07,'sine',0.05),                 // charge tick
+  full:()=>{beep(660,0.09,'triangle',0.09);setTimeout(()=>beep(990,0.14,'triangle',0.09),80);},
+  wreck:()=>beep(140,0.4,'sawtooth',0.12,-90),
+  growl:()=>beep(90,0.5,'square',0.10,-40),
+  strike:()=>{beep(70,0.5,'sawtooth',0.14,-30);beep(55,0.6,'square',0.10,-20);},
+  over:()=>{beep(330,0.25,'triangle',0.09,-120);setTimeout(()=>beep(220,0.5,'triangle',0.09,-140),200);}
+};
+
+/* ---------- input ---------- */
+let pointer=null,dragging=false;
+function pos(e){const r=cv.getBoundingClientRect(),sc=Math.min(r.width/W,r.height/H);
+  const p=e.touches?e.touches[0]:e;return{x:(p.clientX-r.left)/sc,y:(p.clientY-r.top)/sc};}
+function down(e){e.preventDefault();pointer=pos(e);dragging=true;
+  if(S.mode==='menu'){start();return;}
+  if(S.mode==='over'&&performance.now()-S.overAt>350){start();return;}}
+function move(e){if(!dragging&&!e.touches)return;e.preventDefault();pointer=pos(e);}
+function up(){dragging=false;}
+cv.addEventListener('mousedown',down);window.addEventListener('mousemove',move);window.addEventListener('mouseup',up);
+cv.addEventListener('touchstart',down,{passive:false});
+cv.addEventListener('touchmove',move,{passive:false});
+cv.addEventListener('touchend',up);
+
+function start(){reset();S.mode='play';if(ac()&&AC.state==='suspended')AC.resume();}
+
+/* ---------- spawning ---------- */
+let UID=0;
+function spawnShip(){
+  const spd=30+Math.min(42,S.t*0.55);
+  S.ships.push({_id:++UID,x:-46,y:rnd(SEA_T+30,SEA_B-30),v:spd,lit:false,chg:0,bob:Math.random()*6.28});
+}
+function spawnMonster(){
+  S.monsters.push({_id:++UID,x:W+40,y:rnd(SEA_T+50,SEA_B-50),vx:-rnd(16,24),ph:Math.random()*6.28,ang:0,dead:0});
+}
+
+/* ---------- particles / juice ---------- */
+function burst(x,y,n,col){for(let i=0;i<n;i++){const a=Math.random()*6.28,s=rnd(40,190);
+  S.parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,l:rnd(0.4,0.9),col});}}
+function shake(v){S.shake=Math.max(S.shake,v);}
+
+/* ---------- core update ---------- */
+function update(dt){
+  S.t+=dt;
+  if(S.shake>0)S.shake-=dt*3;
+  if(S.flash>0)S.flash-=dt*2.5;
+  if(S.comboT>0){S.comboT-=dt;if(S.comboT<=0)S.combo=0;}
+
+  // beam chases pointer with capped angular speed = sweep skill
+  if(pointer){
+    const ta=Math.atan2(pointer.y-LY,pointer.x-LX);
+    const d=angDiff(S.ang,ta),maxW=3.4;
+    S.beamW=clamp(d*10,-maxW,maxW);
+    S.ang+=S.beamW*dt;
+  }
+
+  // spawn director
+  S.shipT-=dt;
+  const capShips=S.t<35?2:3, sInt=Math.max(1.25,2.6-S.t*0.022);
+  if(S.shipT<=0&&S.ships.filter(s=>!s.lit).length<capShips){spawnShip();S.shipT=sInt;}
+  if(S.t>=20){S.monT-=dt;
+    if(S.monT<=0){spawnMonster();S.monT=Math.max(6.5,13-S.t*0.08);}}
+
+  // ships
+  S.tickT=(S.tickT||0)+dt;
+  for(const sh of S.ships){
+    sh.bob+=dt*3;sh.x+=sh.v*(sh.lit?1.7:1)*dt;sh.y+=Math.sin(sh.bob)*8*dt;
+    if(!sh.lit){
+      const dAng=Math.abs(angDiff(S.ang,Math.atan2(sh.y-LY,sh.x-LX)));
+      const dist=Math.hypot(sh.x-LX,sh.y-LY);
+      const inBeam=dAng<0.16&&sh.x>LX+30&&dist<760;
+      if(inBeam){
+        sh.chg+=dt;
+        if(sh.chg>=1.1){
+          sh.lit=true;S.combo=Math.min(5,S.combo+1);S.comboT=6;
+          const gain=100*S.combo;S.score+=gain;
+          burst(sh.x,sh.y,16,'#ffd166');sfx.full();shake(0.25);
+        }else if(S.tickT>0.12){sfx.tick(sh.chg);}
+      }else sh.chg=Math.max(0,sh.chg-dt*0.5);
+    }
+    if(sh.x>W+20){
+      if(!sh.lit){S.hearts--;S.deathCause='wreck';burst(W-30,sh.y,14,'#ff5c5c');sfx.wreck();shake(1);}
+      sh.gone=true;
+    }
+  }
+  S.ships=S.ships.filter(s=>!s.gone);
+
+  // monsters
+  for(const m of S.monsters){
+    m.ph+=dt*1.4;m.x+=m.vx*dt;m.y+=Math.sin(m.ph)*22*dt;
+    const dAng=Math.abs(angDiff(S.ang,Math.atan2(m.y-LY,m.x-LX)));
+    const inBeam=dAng<0.16&&m.x>LX+40;
+    if(inBeam&&!m.dead){
+      m.ang+=dt;
+      if(m.ang>0.18&&S.tickT>0.3){sfx.growl();S.tickT=0;}
+    }
+    else m.ang=Math.max(0,m.ang-dt*0.35);
+    if(m.ang>=1&&!m.dead){m.dead=1;S.hearts--;S.deathCause='kraken';sfx.strike();shake(1.6);S.flash=1;
+      burst(m.x,m.y,22,'#c77dff');m.gone=true;}
+    if(m.x<-60)m.gone=true;
+  }
+  S.monsters=S.monsters.filter(m=>!m.gone);
+
+  // particles
+  for(const p of S.parts){p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=0.98;p.vy*=0.98;p.l-=dt;}
+  S.parts=S.parts.filter(p=>p.l>0);
+
+  if(S.hearts<=0){S.mode='over';S.overAt=performance.now();
+    if(S.score>best){best=S.score;localStorage.setItem('lk_best',best);}sfx.over();}
+}
+
+/* chunk placeholders */
+function draw(){
+  X.save();
+  if(S.shake>0)X.translate(rnd(-1,1)*S.shake*7,rnd(-1,1)*S.shake*7);
+  // sky
+  const g=X.createLinearGradient(0,0,0,H);g.addColorStop(0,'#0a1024');g.addColorStop(1,'#0d1b33');
+  X.fillStyle=g;X.fillRect(-10,-10,W+20,H+20);
+  // stars
+  X.fillStyle='rgba(255,255,255,0.5)';
+  for(let i=0;i<40;i++){const sx=(i*97)%W,sy=(i*61)%SEA_T;const tw=0.3+0.7*Math.abs(Math.sin(i+S.t*0.7));
+    X.globalAlpha=tw*0.6;X.fillRect(sx,sy,2,2);}
+  X.globalAlpha=1;
+  // moon
+  X.fillStyle='#e8ecf7';X.beginPath();X.arc(400,90,26,0,6.28);X.fill();
+  X.fillStyle='#0a1024';X.beginPath();X.arc(410,84,22,0,6.28);X.fill();
+  // sea
+  const sg=X.createLinearGradient(0,SEA_T,0,H);sg.addColorStop(0,'#0e2242');sg.addColorStop(1,'#081527');
+  X.fillStyle=sg;X.fillRect(0,SEA_T,W,H-SEA_T);
+  // wave lines
+  X.strokeStyle='rgba(120,180,255,0.10)';X.lineWidth=2;
+  for(let r=0;r<7;r++){X.beginPath();const wy=SEA_T+40+r*76;
+    for(let wx=0;wx<=W;wx+=24)X.lineTo(wx,wy+Math.sin(wx*0.03+S.t*(1+r*0.13))*4);X.stroke();}
+
+  // beam
+  if(S.mode==='play'||S.mode==='over'){
+    X.save();X.translate(LX,LY);X.rotate(S.ang);
+    const bg=X.createLinearGradient(0,0,760,0);
+    bg.addColorStop(0,'rgba(255,225,150,0.55)');bg.addColorStop(1,'rgba(255,225,150,0.02)');
+    X.fillStyle=bg;X.beginPath();X.moveTo(14,-5);X.lineTo(760,-760*Math.tan(0.16));
+    X.lineTo(760,760*Math.tan(0.16));X.lineTo(14,5);X.closePath();X.fill();
+    X.restore();
+  }
+  // lighthouse
+  X.fillStyle='#22314f';X.fillRect(LX-16,LY+8,32,120);
+  X.fillStyle='#2f4270';X.fillRect(LX-16,LY+8,32,120*0.28);
+  X.fillStyle='#e8506a';X.fillRect(LX-16,LY+40,32,18);
+  X.fillStyle='#e8506a';X.fillRect(LX-16,LY+88,32,18);
+  X.fillStyle='#1b2740';X.fillRect(LX-20,LY+122,40,10);
+  X.fillStyle='#ffd166';X.beginPath();X.arc(LX,LY,11,0,6.28);X.fill();
+  X.strokeStyle='rgba(255,209,102,0.5)';X.lineWidth=3;
+  X.beginPath();X.arc(LX,LY,15+Math.sin(S.t*4)*3,0,6.28);X.stroke();
+
+  // reef (right edge)
+  X.fillStyle='#16233d';
+  for(let ry=SEA_T+20;ry<SEA_B;ry+=52){
+    X.beginPath();X.moveTo(W,ry);X.lineTo(W-26,ry+18);X.lineTo(W,ry+36);X.closePath();X.fill();
+  }
+  // ships
+  for(const sh of S.ships){
+    const yo=Math.sin(sh.bob)*3;
+    X.save();X.translate(sh.x,sh.y+yo);
+    X.fillStyle=sh.lit?'#7dd3fc':'#3a4a68';
+    X.beginPath();X.moveTo(-18,-4);X.lineTo(18,-4);X.lineTo(12,6);X.lineTo(-12,6);X.closePath();X.fill();
+    X.fillStyle='#1e2a44';X.fillRect(-3,-20,6,16);
+    if(sh.lit){X.fillStyle='#ffd166';X.beginPath();X.arc(0,-24,5,0,6.28);X.fill();
+      X.strokeStyle='rgba(255,209,102,0.45)';X.beginPath();X.arc(0,-24,9+Math.sin(S.t*6)*2,0,6.28);X.stroke();}
+    else{
+      X.fillStyle='rgba(125,211,252,0.9)';X.fillRect(6,-14,14*sh.chg,3);
+      X.strokeStyle='rgba(255,255,255,0.25)';X.strokeRect(6,-14,14,3);
+    }
+    X.restore();
+    // wake
+    if(Math.random()<0.3)S.waves.push({x:sh.x-20,y:sh.y+8,l:0.7});
+  }
+  // monsters (kraken tentacle silhouette)
+  for(const m of S.monsters){
+    X.save();X.translate(m.x,m.y);
+    X.fillStyle=m.dead?'#4a3050':'#5b3a7e';
+    for(let k=0;k<5;k++){const a=m.ph+k*1.256;
+      X.beginPath();X.ellipse(Math.cos(a)*10,Math.sin(a)*8,14,7,a,0,6.28);X.fill();}
+    X.fillStyle='#ffd166';X.beginPath();X.arc(0,-4,3,0,6.28);X.fill();
+    if(m.ang>0.05&&!m.dead){ // anger ring
+      X.strokeStyle='rgba(255,92,92,'+Math.min(1,m.ang+0.2)+')';X.lineWidth=3;
+      X.beginPath();X.arc(0,0,20,-1.57,-1.57+m.ang*6.28);X.stroke();}
+    X.restore();
+  }
+  // waves & particles
+  X.fillStyle='rgba(160,210,255,0.35)';
+  for(const w of S.waves){w.l-=0.016;X.globalAlpha=Math.max(0,w.l);X.fillRect(w.x,w.y,6,2);}
+  X.globalAlpha=1;
+  S.waves=S.waves.filter(w=>w.l>0);
+  for(const p of S.parts){X.globalAlpha=Math.max(0,p.l);X.fillStyle=p.col;X.fillRect(p.x,p.y,4,4);}
+  X.globalAlpha=1;
+
+  // HUD
+  X.fillStyle='#e8ecf7';X.font='bold 26px system-ui,sans-serif';X.textAlign='left';
+  X.fillText(String(S.score),18,42);
+  X.fillStyle='#9fb3d9';X.font='13px system-ui,sans-serif';
+  X.fillText('BEST '+best,18,62);
+  for(let i=0;i<S.hearts;i++){X.fillStyle='#ff5c78';
+    X.beginPath();X.arc(W-24-i*26,32,8,0,6.28);X.fill();}
+  if(S.combo>1){X.fillStyle='#ffd166';X.font='bold 20px system-ui,sans-serif';X.textAlign='center';
+    X.fillText('×'+S.combo,W/2,44);}
+
+  // overlays
+  if(S.mode==='menu'){
+    X.fillStyle='rgba(6,9,19,0.55)';X.fillRect(0,0,W,H);
+    X.textAlign='center';
+    X.fillStyle='#ffd166';X.font='bold 44px system-ui,sans-serif';
+    X.fillText('LIGHTKEEP',W/2,300);
+    X.fillStyle='#cdd9f2';X.font='16px system-ui,sans-serif';
+    X.fillText('Drag to turn the beam.',W/2,352);
+    X.fillText('Hold light on ships to fill their lantern.',W/2,380);
+    X.fillText('Never let the beam rest on the kraken.',W/2,408);
+    X.fillText('Unlit ships wreck on the reef → -♥',W/2,436);
+    X.fillStyle='#8fa3c8';X.font='14px system-ui,sans-serif';
+    X.fillText('tap to start',W/2,520);
+  }
+  if(S.mode==='over'){
+    X.fillStyle='rgba(6,9,19,0.6)';X.fillRect(0,0,W,H);
+    X.textAlign='center';
+    X.fillStyle='#ff5c78';X.font='bold 38px system-ui,sans-serif';
+    X.fillText(S.deathCause==='kraken'?'THE KRAKEN GOT YOU':'A SHIP WRECKED',W/2,330);
+    X.fillStyle='#e8ecf7';X.font='bold 30px system-ui,sans-serif';
+    X.fillText('score '+S.score,W/2,390);
+    X.fillStyle='#9fb3d9';X.font='16px system-ui,sans-serif';
+    X.fillText('best '+best,W/2,420);
+    X.fillText('tap to relight',W/2,480);
+  }
+  if(S.flash>0){X.fillStyle='rgba(199,125,255,'+(S.flash*0.25)+')';X.fillRect(0,0,W,H);}
+  X.restore();
+}
+let last=0;
+function loop(ts){
+  requestAnimationFrame(loop);
+  const dt=Math.min(0.05,(ts-last)/1000||0.016);last=ts;
+  if(S.mode==='play')update(dt);
+  draw();
+}
+reset();
+requestAnimationFrame(loop);
+
+/* ---------- autotest bot (?autotest) ---------- */
+if(location.search.indexOf('autotest')>=0){
+  window.__autotest=true;window.__deathDump='';
+  let letDeaths=0,lastMode='menu';
+  function botTick(){
+    try{
+      if(S.mode==='menu'){start();return;}
+      if(S.mode==='over'){
+        if(lastMode!=='over'){lastMode='over';letDeaths++;window.__deathDump=JSON.stringify({cause:S.deathCause,t:+S.t.toFixed(1),score:S.score,ships:S.ships.length,mons:S.monsters.length});}
+        if(performance.now()-S.overAt>600){lastMode='play';start();}
+        return;
+      }
+      lastMode='play';
+      // danger: enraged kraken nearby in angle → swing away
+      const threat=S.monsters.find(m=>!m.dead&&m.ang>0.4);
+      let ta;
+      if(threat){
+        const ma=Math.atan2(threat.y-LY,threat.x-LX);
+        ta=ma+1.4; // swing off
+      }else{
+        // target: unlit ship closest to reef, else park upward
+        let t=null;for(const sh of S.ships)if(!sh.lit&&(!t||sh.x>t.x))t=sh;
+        ta=t?Math.atan2(t.y-LY,t.x-LX):-Math.PI/2;
+      }
+      pointer={x:LX+Math.cos(ta)*300,y:LY+Math.sin(ta)*300};
+    }catch(e){window.__botErr=String(e&&e.stack||e);}
+  }
+  setInterval(botTick,50);
+  setInterval(()=>{document.title='st='+S.mode+' sc='+S.score+' h='+S.hearts+' d='+letDeaths+
+    ' t='+S.t.toFixed(0)+' shp='+S.ships.length+' mn='+S.monsters.length+
+    ' c='+S.combo+(window.__botErr?' ERR':'');},200);
+}
+</script>
+</body>
+</html>
