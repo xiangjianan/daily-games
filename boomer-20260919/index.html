@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>BOOMER — flick the boomerang</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🪃</text></svg>">
+<style>
+  html,body{margin:0;padding:0;background:#0d1117;height:100%;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{background:#101826;touch-action:none}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<script>
+"use strict";
+// ============ BOOMER — flick the boomerang, cut fruit, catch it back ============
+const W=480,H=800;
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+let scale=1,offX=0,offY=0;
+function resize(){
+  const r=Math.min(innerWidth/W,innerHeight/H);
+  cv.width=W*r*devicePixelRatio; cv.height=H*r*devicePixelRatio;
+  cv.style.width=W*r+"px"; cv.style.height=H*r+"px";
+  ctx.setTransform(r*devicePixelRatio,0,0,r*devicePixelRatio,0,0);
+}
+addEventListener("resize",resize); resize();
+
+// ---- constants (tuned) ----
+const HAND={x:240,y:728};
+const CHASE=460;         // homing accel toward hand while flying (px/s^2)
+const FLY_MAX=6.5;       // s before a throw counts as lost
+const CATCH_R=66;        // catch radius
+const CUT_R=34;          // boomerang vs fruit cut radius
+const FRUITS_ONFIELD=4;
+const GRAV_F=0;          // fruits float (no gravity)
+
+// ---- state ----
+const S={mode:"menu",score:0,best:+(localStorage.getItem("boomer_best")||0),
+  lives:3,t:0,chain:0,flightT:0,cutThisFlight:0,shake:0,hitstop:0,overAt:0,cause:""};
+const B={x:HAND.x,y:HAND.y-30,vx:0,vy:0,st:"held",spin:0,trail:[]};
+let fruits=[],bombs=[],parts=[],floats=[],nextFruit=0;
+let ptr={down:false,sx:0,sy:0,ex:0,ey:0,t0:0};
+
+// ---- helpers ----
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const dist=(ax,ay,bx,by)=>Math.hypot(ax-bx,ay-by);
+
+// ---- audio (WebAudio synth, no files) ----
+let AC=null;
+function ac(){ if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}} if(AC&&AC.state==="suspended")AC.resume(); return AC; }
+function beep(freq,dur,type,vol,slide){
+  const a=ac(); if(!a)return;
+  const o=a.createOscillator(),g=a.createGain();
+  o.type=type||"sine"; o.frequency.setValueAtTime(freq,a.currentTime);
+  if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,slide),a.currentTime+dur);
+  g.gain.setValueAtTime(vol||0.15,a.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,a.currentTime+dur);
+  o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime+dur+0.02);
+}
+function sThrow(){beep(220,0.18,"triangle",0.12,90);}
+function sCut(n){beep(520+n*90,0.12,"square",0.14,880+n*110);}
+function sCatch(){beep(392,0.09,"sine",0.16); setTimeout(()=>beep(523,0.12,"sine",0.16),70);}
+function sBomb(){beep(90,0.4,"sawtooth",0.28,40); S.shake=14;}
+function sLose(){beep(300,0.35,"sawtooth",0.2,80);}
+function sOver(){beep(200,0.5,"sawtooth",0.22,60);}
+
+// ---- entities ----
+function fruitPos(){
+  // guaranteed-reachable band, never too close to hand or another fruit
+  for(let k=0;k<40;k++){
+    const x=rnd(64,W-64),y=rnd(215,625);
+    if(dist(x,y,HAND.x,HAND.y)<150)continue;
+    let ok=true;
+    for(const f of fruits)if(dist(x,y,f.x,f.y)<78){ok=false;break;}
+    if(ok)return{x,y};
+  }
+  return{x:rnd(80,W-80),y:rnd(240,600)};
+}
+function spawnFruit(){
+  const p=fruitPos();
+  fruits.push({x:p.x,y:p.y,r:15,age:0,ph:rnd(0,6.28),wob:rnd(10,22),kind:"fruit"});
+}
+function spawnBomb(){
+  const p=fruitPos();
+  bombs.push({x:p.x,y:p.y,r:15,age:0,ph:rnd(0,6.28),wob:rnd(10,22)});
+}
+
+// ---- game flow ----
+function reset(){
+  S.score=0;S.lives=3;S.t=0;S.chain=0;S.flightT=0;S.cutThisFlight=0;S.shake=0;S.hitstop=0;
+  fruits=[];bombs=[];parts=[];floats=[];
+  B.x=HAND.x;B.y=HAND.y-30;B.vx=0;B.vy=0;B.st="held";B.spin=0;B.trail=[];
+  for(let i=0;i<FRUITS_ONFIELD;i++)spawnFruit();
+  nextFruit=6;
+}
+function startGame(){reset();S.mode="play";}
+function throwBoomerang(dx,dy){
+  // flick vector -> initial velocity; homing pulls it back to hand
+  const len=Math.hypot(dx,dy);
+  if(len<18)return;
+  const spd=Math.min(1180,len*5.2);
+  B.vx=dx/len*spd; B.vy=dy/len*spd;
+  B.st="flying"; S.flightT=0; S.cutThisFlight=0;
+  sThrow();
+}
+function cutFruit(f,arr,i){
+  arr.splice(i,1);
+  S.cutThisFlight++;
+  const mult=Math.min(S.cutThisFlight,5);
+  S.score+=10*mult;
+  floats.push({x:f.x,y:f.y,txt:"+"+(10*mult)+(mult>1?" x"+mult:""),t:0.9,vy:-60});
+  for(let p=0;p<12;p++){const a=rnd(0,6.28),v=rnd(40,220);
+    parts.push({x:f.x,y:f.y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,t:rnd(0.3,0.6),c:f.kind==="bomb"?"#ff5a5a":"#ffd166"});}
+  sCut(S.cutThisFlight);
+  if(S.cutThisFlight>=3)S.hitstop=0.12;
+  S.chain=Math.max(S.chain,S.cutThisFlight);
+}
+function loseLife(cause){
+  S.cause=cause; S.lives--; S.shake=10; sLose();
+  S.chain=0;S.cutThisFlight=0;
+  if(B.st==="flying"){B.st="held";B.x=HAND.x;B.y=HAND.y-30;B.vx=B.vy=0;B.trail=[];}
+  if(S.lives<=0){S.mode="over";S.overAt=performance.now();
+    if(S.score>S.best){S.best=S.score;localStorage.setItem("boomer_best",S.best);}
+    sOver();}
+}
+function catchBoomerang(){
+  B.st="held";B.x=HAND.x;B.y=HAND.y-30;B.vx=B.vy=0;B.trail=[];
+  sCatch();
+  for(let p=0;p<8;p++){const a=rnd(0,6.28),v=rnd(30,120);
+    parts.push({x:HAND.x,y:HAND.y-30,vx:Math.cos(a)*v,vy:Math.sin(a)*v,t:0.35,c:"#7ee8fa"});}
+}
+
+// ---- update ----
+function update(dt){
+  S.shake=Math.max(0,S.shake-dt*40);
+  // particles & floats always tick
+  for(let i=parts.length-1;i>=0;i--){const p=parts[i];p.t-=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=0.92;p.vy*=0.92;if(p.t<=0)parts.splice(i,1);}
+  for(let i=floats.length-1;i>=0;i--){const f=floats[i];f.t-=dt;f.y+=f.vy*dt;if(f.t<=0)floats.splice(i,1);}
+  if(S.mode!=="play")return;
+  S.t+=dt;
+
+  // fruit/bomb idle bob
+  for(const f of fruits){f.age+=dt;f.y+=Math.sin(f.age*2+f.ph)*f.wob*dt*0.4;}
+  for(const b of bombs){b.age+=dt;b.y+=Math.sin(b.age*2+b.ph)*b.wob*dt*0.4;}
+
+  // replenish fruits; difficulty ramps bomb ratio over time
+  nextFruit-=dt;
+  if(nextFruit<=0){
+    const bombP=Math.min(0.34,Math.max(0,0.012*(S.t-22)));
+    if(Math.random()<bombP&&bombs.length<3)spawnBomb();else if(fruits.length<FRUITS_ONFIELD+2)spawnFruit();
+    nextFruit=rnd(1.6,2.8)*Math.max(0.65,1-S.t*0.006);
+  }
+  // expire old fruit (keeps board fresh)
+  for(let i=fruits.length-1;i>=0;i--)if(fruits[i].age>14){fruits.splice(i,1);spawnFruit();}
+
+  // boomerang flight physics
+  if(B.st==="flying"){
+    S.flightT+=dt;
+    const dxh=HAND.x-B.x,dyh=(HAND.y-30)-B.y,d=Math.hypot(dxh,dyh)||1;
+    // homing accel back to hand — constant & gentle: initial speed decides
+    // everything. Soft flick = safe return; hard flick = real escape risk.
+    let chase=CHASE, drag=0.22;
+    if(S.flightT>3){chase=2600;drag=2.8;} // failsafe recall after 3s
+    B.vx+=dxh/d*chase*dt; B.vy+=dyh/d*chase*dt;
+    B.vx-=B.vx*drag*dt; B.vy-=B.vy*drag*dt;
+    B.x+=B.vx*dt; B.y+=B.vy*dt;
+    B.spin+=dt*22;
+    B.trail.push({x:B.x,y:B.y}); if(B.trail.length>26)B.trail.shift();
+
+    // cut fruits / bombs on the arc
+    for(let i=fruits.length-1;i>=0;i--){const f=fruits[i];if(dist(B.x,B.y,f.x,f.y)<CUT_R+f.r)cutFruit(f,fruits,i);}
+    for(let i=bombs.length-1;i>=0;i--){const b=bombs[i];
+      if(dist(B.x,B.y,b.x,b.y)<CUT_R+b.r){
+        bombs.splice(i,1); sBomb();
+        for(let p=0;p<16;p++){const a=rnd(0,6.28),v=rnd(60,260);
+          parts.push({x:b.x,y:b.y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,t:rnd(0.3,0.6),c:"#ff5a5a"});}
+        floats.push({x:b.x,y:b.y,txt:"-1 LIFE",t:1,vy:-50,c:"#ff5a5a"});
+        S.lives--; S.shake=16; S.chain=0;
+        if(S.lives<=0){S.mode="over";S.overAt=performance.now();S.cause="bomb";
+          if(S.score>S.best){S.best=S.score;localStorage.setItem("boomer_best",S.best);}sOver();return;}
+        B.st="held";B.x=HAND.x;B.y=HAND.y-30;B.vx=B.vy=0;B.trail=[];}}
+
+    // catch it back
+    if(S.flightT>0.32&&dist(B.x,B.y,HAND.x,HAND.y-30)<88)catchBoomerang();
+    // lost: off screen or too long airborne
+    if(B.st==="flying"&&(B.x<-50||B.x>W+50||B.y<-50||B.y>H+50||S.flightT>FLY_MAX))loseLife("lost");
+  }
+}
+
+// ---- draw ----
+function draw(){
+  ctx.save();
+  if(S.shake>0)ctx.translate(rnd(-S.shake,S.shake)*0.5,rnd(-S.shake,S.shake)*0.5);
+  // bg: night grove
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,"#101826");g.addColorStop(1,"#0b1120");
+  ctx.fillStyle=g;ctx.fillRect(-20,-20,W+40,H+40);
+  ctx.fillStyle="rgba(255,255,255,0.05)";
+  for(let i=0;i<24;i++){const x=(i*197)%W,y=(i*83)%500;ctx.fillRect(x,y,2,2);}
+  // ground
+  ctx.fillStyle="#16202f";ctx.fillRect(0,H-64,W,64);
+  ctx.fillStyle="#1f2c40";ctx.fillRect(0,H-64,W,3);
+
+  // aim line while pressing
+  if(ptr.down&&S.mode==="play"&&B.st==="held"){
+    const dx=ptr.ex-ptr.sx,dy=ptr.ey-ptr.sy,len=Math.hypot(dx,dy);
+    if(len>14){
+      ctx.strokeStyle="rgba(126,232,250,0.45)";ctx.lineWidth=3;ctx.setLineDash([6,8]);
+      ctx.beginPath();ctx.moveTo(HAND.x,HAND.y-30);
+      ctx.lineTo(HAND.x+dx/len*Math.min(150,len),HAND.y-30+dy/len*Math.min(150,len));ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // fruits
+  for(const f of fruits){
+    ctx.save();ctx.translate(f.x,f.y);
+    ctx.fillStyle="#ffd166";ctx.beginPath();ctx.arc(0,0,f.r,0,6.28);ctx.fill();
+    ctx.fillStyle="rgba(255,255,255,0.35)";ctx.beginPath();ctx.arc(-4,-5,4,0,6.28);ctx.fill();
+    ctx.strokeStyle="#7bc96f";ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(2,-f.r);ctx.quadraticCurveTo(8,-f.r-7,13,-f.r-9);ctx.stroke();
+    ctx.restore();
+  }
+  // bombs
+  for(const b of bombs){
+    ctx.save();ctx.translate(b.x,b.y);
+    ctx.fillStyle="#2b2f38";ctx.beginPath();ctx.arc(0,0,b.r,0,6.28);ctx.fill();
+    ctx.strokeStyle=(b.age%1<0.5)?"#ff5a5a":"#5a6070";ctx.lineWidth=2.5;ctx.stroke();
+    ctx.fillStyle="#ff9f43";ctx.fillRect(-2,-b.r-6,4,6);
+    ctx.restore();
+  }
+  // boomerang trail + body
+  if(B.st==="flying"){
+    ctx.strokeStyle="rgba(126,232,250,0.5)";ctx.lineWidth=3;ctx.beginPath();
+    for(let i=0;i<B.trail.length;i++){const p=B.trail[i];i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y);}
+    ctx.stroke();
+  }
+  ctx.save();ctx.translate(B.x,B.y);ctx.rotate(B.spin);
+  ctx.fillStyle="#7ee8fa";
+  ctx.beginPath();ctx.moveTo(-14,4);ctx.lineTo(0,-12);ctx.lineTo(14,4);ctx.lineTo(9,8);ctx.lineTo(0,-2);ctx.lineTo(-9,8);ctx.closePath();ctx.fill();
+  ctx.restore();
+
+  // thrower hand
+  const pulse=1+Math.max(0,0.25-(performance.now()%1000)/4000);
+  ctx.fillStyle="#3a4a63";ctx.beginPath();ctx.arc(HAND.x,HAND.y,26*pulse,0,6.28);ctx.fill();
+  ctx.fillStyle="#7ee8fa";ctx.beginPath();ctx.arc(HAND.x,HAND.y-30,10,0,6.28);ctx.fill();
+  ctx.fillStyle="#2a3850";ctx.fillRect(HAND.x-16,HAND.y-8,32,18);
+
+  // particles & floats
+  for(const p of parts){ctx.globalAlpha=Math.max(0,p.t*2);ctx.fillStyle=p.c;ctx.fillRect(p.x-3,p.y-3,6,6);}
+  ctx.globalAlpha=1;
+  for(const f of floats){ctx.globalAlpha=Math.min(1,f.t*2);ctx.fillStyle=f.c||"#fff";
+    ctx.font="bold 20px system-ui";ctx.textAlign="center";ctx.fillText(f.txt,f.x,f.y);}
+  ctx.globalAlpha=1;
+
+  // HUD
+  ctx.fillStyle="#e6edf3";ctx.font="bold 26px system-ui";ctx.textAlign="left";
+  ctx.fillText(String(S.score),16,38);
+  ctx.font="14px system-ui";ctx.fillStyle="#8b98ab";
+  ctx.fillText("BEST "+S.best,16,60);
+  for(let i=0;i<S.lives;i++){ctx.fillStyle="#ff5a5a";ctx.beginPath();ctx.arc(W-24-i*26,30,8,0,6.28);ctx.fill();}
+
+  // menu / over overlays
+  if(S.mode==="menu"){
+    ctx.fillStyle="rgba(8,12,20,0.72)";ctx.fillRect(0,0,W,H);
+    ctx.textAlign="center";ctx.fillStyle="#7ee8fa";ctx.font="bold 56px system-ui";
+    ctx.fillText("🪃",W/2,H*0.30);ctx.fillText("BOOMER",W/2,H*0.40);
+    ctx.fillStyle="#e6edf3";ctx.font="17px system-ui";
+    ctx.fillText("Flick to throw the boomerang.",W/2,H*0.50);
+    ctx.fillText("Cut fruit on the arc — catch it on the way back.",W/2,H*0.545);
+    ctx.fillText("Lose it (or hit a bomb) and you lose a life.",W/2,H*0.59);
+    ctx.fillStyle="#ffd166";ctx.font="bold 22px system-ui";
+    ctx.fillText("TAP TO START",W/2,H*0.70);
+    ctx.fillStyle="#8b98ab";ctx.font="13px system-ui";
+    ctx.fillText("best: "+S.best,W/2,H*0.75);
+  }
+  if(S.mode==="over"){
+    ctx.fillStyle="rgba(8,12,20,0.78)";ctx.fillRect(0,0,W,H);
+    ctx.textAlign="center";ctx.fillStyle="#ff5a5a";ctx.font="bold 44px system-ui";
+    ctx.fillText("DROPPED!",W/2,H*0.36);
+    ctx.fillStyle="#e6edf3";ctx.font="bold 30px system-ui";
+    ctx.fillText("score  "+S.score,W/2,H*0.46);
+    ctx.fillStyle="#8b98ab";ctx.font="16px system-ui";
+    ctx.fillText("best  "+S.best+(S.score>=S.best&&S.score>0?"  ★ NEW!":""),W/2,H*0.51);
+    ctx.fillStyle="#ffd166";ctx.font="bold 22px system-ui";
+    ctx.fillText("TAP TO RETRY",W/2,H*0.62);
+  }
+  ctx.restore();
+}
+
+// ---- input (mouse + touch, unified) ----
+function toLocal(e){
+  const r=cv.getBoundingClientRect();
+  const t=e.touches?e.touches[0]:e;
+  return{x:(t.clientX-r.left)/r.width*W,y:(t.clientY-r.top)/r.height*H};
+}
+function press(x,y){
+  ac();
+  if(S.mode==="menu"){startGame();return;}
+  if(S.mode==="over"){if(performance.now()-S.overAt>350)startGame();return;}
+  if(B.st!=="held")return;
+  ptr.down=true;ptr.sx=x;ptr.sy=y;ptr.ex=x;ptr.ey=y;ptr.t0=performance.now();
+}
+function release(x,y){
+  if(!ptr.down)return; ptr.down=false;
+  if(S.mode!=="play"||B.st!=="held")return;
+  const dx=x-ptr.sx,dy=y-ptr.sy;
+  const dtms=Math.max(16,performance.now()-ptr.t0);
+  throwBoomerang(dx,dy); // flick vector, speed scaled inside
+}
+cv.addEventListener("mousedown",e=>{const p=toLocal(e);press(p.x,p.y);});
+addEventListener("mouseup",e=>{const p=toLocal(e);release(p.x,p.y);});
+cv.addEventListener("mousemove",e=>{if(ptr.down){const p=toLocal(e);ptr.ex=p.x;ptr.ey=p.y;}});
+cv.addEventListener("touchstart",e=>{e.preventDefault();const p=toLocal(e);press(p.x,p.y);},{passive:false});
+cv.addEventListener("touchmove",e=>{e.preventDefault();if(ptr.down){const p=toLocal(e);ptr.ex=p.x;ptr.ey=p.y;}},{passive:false});
+addEventListener("touchend",e=>{if(ptr.down){ptr.down=false;
+  if(S.mode==="play"&&B.st==="held")throwBoomerang(ptr.ex-ptr.sx,ptr.ey-ptr.sy);
+  else if(S.mode==="menu")startGame();
+  else if(S.mode==="over"&&performance.now()-S.overAt>350)startGame();
+}});
+
+// ---- loop ----
+let last=0;
+// ---- autotest bot (?autotest): setInterval-driven loop + title telemetry ----
+if(location.search.includes("autotest")){
+  window.__autotest=true;
+  window.requestAnimationFrame=function(){}; // single driver: setInterval below
+  window.__loopErr="";
+  setInterval(()=>{try{loop(performance.now());}catch(e){window.__loopErr=String(e&&e.stack||e).slice(0,300);}},16);
+  setInterval(()=>{
+    if(S.mode!=="play"){ // auto start / retry
+      if(S.mode==="menu")startGame();
+      else if(S.mode==="over"&&performance.now()-S.overAt>400)startGame();
+      return;
+    }
+    if(B.st==="held"&&fruits.length){
+      if(location.search.includes("suicide")){ throwBoomerang(0,-300); } // full-power straight up: guaranteed escape
+      else{
+      // pick best pair: hand -> f1 -> f2 roughly collinear (arc cuts both), else farthest
+      let best=null,bestScore=-1;
+      for(const f1 of fruits){
+        const d1=dist(f1.x,f1.y,HAND.x,HAND.y);
+        let pair=0;
+        for(const f2 of fruits){ if(f2===f1)continue;
+          const d2=dist(f2.x,f2.y,HAND.x,HAND.y);
+          if(d2<=d1)continue;
+          // collinearity: f2 close to ray hand->f1
+          const ux=(f1.x-HAND.x)/d1,uy=(f1.y-HAND.y)/d1;
+          const px=f2.x-HAND.x,py=f2.y-HAND.y;
+          const proj=px*ux+py*uy;
+          const perp=Math.abs(px*uy-py*ux);
+          if(proj>d1&&perp<55)pair++;
+        }
+        const s=pair*1000+d1;
+        if(s>bestScore){bestScore=s;best=f1;}
+      }
+      if(best){const dx=best.x-HAND.x,dy=(best.y-HAND.y-30)-120;
+        const l=Math.hypot(dx,dy)||1;
+        throwBoomerang(dx/l*135,dy/l*135);}
+      }
+    }
+    document.title="st="+S.mode+" sc="+S.score+" lv="+S.lives+" ft="+S.flightT.toFixed(2)+" bs="+B.st+" cause="+S.cause+" fr="+fruits.length;
+  },200);
+}
+function loop(ts){
+  const dt=Math.min(0.033,(ts-last)/1000||0.016); last=ts;
+  if(S.hitstop>0){S.hitstop-=dt; dt*=0.15;}
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
