@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>PUFF — inflate to rise, deflate to sink</title>
+<link rel="icon" href="data:,">
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0b1020;overflow:hidden;
+    font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;}
+  #wrap{position:relative;height:100%;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;touch-action:none;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv" width="390" height="600"></canvas></div>
+<script>
+'use strict';
+/* ============================================================
+   PUFF — one-button size-and-altitude runner
+   Hold: inflate (grow + buoyant rise).  Release: deflate (shrink + sink).
+   Your size is a dial: big gems need a big balloon, tight gaps need a small one.
+   ============================================================ */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+
+/* ---------- responsive scale (fit window, keep aspect) ---------- */
+function fit(){
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width  = Math.floor(W * s) + 'px';
+  cv.style.height = Math.floor(H * s) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+/* ---------- audio: tiny WebAudio synth, no files ---------- */
+let AC = null;
+function ac(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return AC; }
+function beep(freq, dur, type, vol, slide){
+  const a = ac(); if(!a) return;
+  if(a.state === 'suspended') a.resume();
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type || 'sine'; o.frequency.setValueAtTime(freq, a.currentTime);
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, slide), a.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.12, a.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(); o.stop(a.currentTime + dur + 0.02);
+}
+function noiseBurst(dur, vol){
+  const a = ac(); if(!a) return;
+  if(a.state === 'suspended') a.resume();
+  const n = a.sampleRate * dur, buf = a.createBuffer(1, n, a.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i = 0; i < n; i++) d[i] = (Math.random()*2 - 1) * (1 - i/n);
+  const src = a.createBufferSource(); src.buffer = buf;
+  const g = a.createGain(); g.gain.value = vol || 0.25;
+  src.connect(g); g.connect(a.destination); src.start();
+}
+const SFX = {
+  gem(combo){ beep(660 + Math.min(combo,8)*110, 0.14, 'sine', 0.14, 1320 + combo*80); },
+  pass(){ beep(340, 0.07, 'triangle', 0.07); },
+  die(){ noiseBurst(0.35, 0.3); beep(180, 0.4, 'sawtooth', 0.12, 40); },
+  puffUp(){ beep(220, 0.09, 'sine', 0.05, 330); },
+  puffDown(){ beep(330, 0.09, 'sine', 0.05, 200); }
+};
+
+/* ---------- game state ---------- */
+const ST = { MENU:0, PLAY:1, DEAD:2 };
+let state = ST.MENU;
+let pressing = false;
+
+const BEST_KEY = 'puff_drift_best';
+let best = 0;
+try{ best = parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; }catch(e){}
+
+const player = { x:110, y:H/2, vy:0, air:0.35, r:20, sq:1 };
+let walls = [], gems = [], parts = [], bubbles = [];
+let score = 0, gemsGot = 0, combo = 0, comboTimer = 0;
+let speed = 2.6, dist = 0, nextWallX = 0, shake = 0, deadT = 0;
+let frame = 0;
+
+/* air -> radius */
+const R_MIN = 12, R_MAX = 34;
+function radOf(a){ return R_MIN + a * (R_MAX - R_MIN); }
+/* gem size classes: 0 small (needs r<=20), 1 big (needs r>=26) */
+
+function reset(){
+  player.x = 110; player.y = H * 0.42; player.vy = 0; player.air = 0.35; player.r = radOf(0.35); player.sq = 1;
+  walls = []; gems = []; parts = [];
+  score = 0; gemsGot = 0; combo = 0; comboTimer = 0;
+  speed = 2.6; dist = 0; nextWallX = W + 140; shake = 0; deadT = 0; frame = 0;
+  /* ambient background bubbles */
+  bubbles = [];
+  for(let i = 0; i < 26; i++) bubbles.push({ x: Math.random()*W, y: Math.random()*H, r: 1+Math.random()*2.5, s: 0.2+Math.random()*0.5 });
+}
+
+/* ---------- level generation ---------- */
+function gapHeight(){ /* 180 -> 108 over distance */
+  const t = Math.min(1, dist / 5200);
+  return 180 - 72 * t;
+}
+function wallSpacing(){ /* px between walls: 360 -> 250 */
+  const t = Math.min(1, dist / 5200);
+  return 360 - 110 * t;
+}
+function spawnWall(){
+  const g = gapHeight() + Math.random()*24;      // gap height w/ variance
+  const margin = 70;
+  const top = margin + Math.random() * (H - g - margin*2);
+  const w = 46;
+  const wall = { x: nextWallX, w, top, bot: top + g, passed:false };
+  walls.push(wall);
+  /* gems: after each wall, alternating small/big; place in safe band */
+  if(walls.length > 1){
+    const cls = Math.random() < 0.55 ? 0 : 1;
+    const gy = (cls === 0)
+      ? (H - 60) - Math.random()*140        // low: encourages deflate
+      : 60 + Math.random()*140;             // high: encourages inflate
+    gems.push({ x: nextWallX + wallSpacing()*0.55, y: gy, cls, got:false, t: Math.random()*6 });
+  }
+  /* spikes on walls appear after score threshold */
+  const t = Math.min(1, dist / 5200);
+  if(dist > 900 && Math.random() < 0.35 + 0.4*t){
+    wall.spikeTop = 22 + Math.random()*14;
+    wall.spikeBot = 22 + Math.random()*14;
+    wall.spOn = Math.random() < 0.5 ? 'top' : 'bot';
+  }
+  nextWallX += wallSpacing() * (0.92 + Math.random()*0.16);
+}
+
+/* ---------- input ---------- */
+function press(){
+  if(state === ST.MENU){ reset(); state = ST.PLAY; pressing = true; SFX.puffUp(); return; }
+  if(state === ST.DEAD){ if(deadT > 0.45){ reset(); state = ST.PLAY; pressing = true; SFX.puffUp(); } return; }
+  if(!pressing){ pressing = true; SFX.puffUp(); }
+}
+function release(){ if(pressing){ pressing = false; if(state === ST.PLAY) SFX.puffDown(); } }
+
+window.addEventListener('mousedown', e => { e.preventDefault(); press(); });
+window.addEventListener('mouseup',   () => release());
+window.addEventListener('touchstart', e => { e.preventDefault(); press(); }, {passive:false});
+window.addEventListener('touchend',   e => { e.preventDefault(); release(); }, {passive:false});
+window.addEventListener('keydown', e => { if(e.code === 'Space'){ e.preventDefault(); press(); } });
+window.addEventListener('keyup',   e => { if(e.code === 'Space') release(); });
+
+/* ---------- particles ---------- */
+function burst(x, y, color, n, spd){
+  for(let i = 0; i < n; i++){
+    const a = Math.random()*Math.PI*2, v = (0.3+Math.random()*0.7)*spd;
+    parts.push({ x, y, vx: Math.cos(a)*v, vy: Math.sin(a)*v, life: 0.5+Math.random()*0.5, t: 0, c: color, r: 1.5+Math.random()*3 });
+  }
+}
+
+/* ---------- collision helpers ---------- */
+function circleRect(cx, cy, r, rx, ry, rw, rh){
+  const nx = Math.max(rx, Math.min(cx, rx+rw));
+  const ny = Math.max(ry, Math.min(cy, ry+rh));
+  const dx = cx-nx, dy = cy-ny;
+  return dx*dx + dy*dy < r*r;
+}
+
+/* ---------- update ---------- */
+function update(dt){
+  frame++;
+  /* background bubbles always drift */
+  for(const b of bubbles){
+    b.x -= (b.s + (state===ST.PLAY?speed*0.25:0)) * dt * 60 * 0.4;
+    b.y -= b.s * dt * 8;
+    if(b.x < -6){ b.x = W + 6; b.y = Math.random()*H; }
+  }
+  /* particles */
+  for(let i = parts.length-1; i >= 0; i--){
+    const p = parts[i];
+    p.t += dt; p.x += p.vx*dt*60; p.y += p.vy*dt*60; p.vy += 0.06*dt*60;
+    if(p.t > p.life) parts.splice(i,1);
+  }
+  if(shake > 0) shake = Math.max(0, shake - dt*3.2);
+
+  if(state === ST.DEAD){ deadT += dt; return; }
+  if(state !== ST.PLAY) return;
+
+  /* difficulty ramp */
+  dist += speed * dt * 60;
+  speed = Math.min(5.2, 2.6 + dist/5200 * 2.6);
+  score = Math.floor(dist / 12) + gemsGot * 25;
+
+  /* physics: air <-> radius <-> buoyancy */
+  const wasAir = player.air;
+  if(pressing) player.air = Math.min(1, player.air + dt*1.05);
+  else         player.air = Math.max(0, player.air - dt*1.4);
+  if(Math.abs(player.air - wasAir) > 0.0001){
+    player.r = radOf(player.air);
+    player.sq = 1 + (player.air - wasAir) * 1.6;   // squash/stretch kick
+  }
+  player.sq += (1 - player.sq) * Math.min(1, dt*8);
+  const lift = pressing ? -520 : 560;
+  player.vy += lift * dt;
+  player.vy = Math.max(-300, Math.min(300, player.vy));
+  player.y += player.vy * dt;
+  player.y = Math.max(player.r + 4, Math.min(H - player.r - 4, player.y));
+
+  /* spawn / scroll */
+  const dx = speed * dt * 60;
+  nextWallX -= dx;
+  while(nextWallX < W + 400) spawnWall();
+  for(const w of walls) w.x -= dx;
+  for(const g of gems)  g.x -= speed * dt * 60;
+  while(walls.length && walls[0].x + walls[0].w < -20) walls.shift();
+  gems = gems.filter(g => g.x > -30 && !g.got);
+
+  /* wall pass scoring */
+  for(const w of walls){
+    if(!w.passed && w.x + w.w < player.x - player.r){
+      w.passed = true; SFX.pass();
+    }
+  }
+
+  /* gems: size matching */
+  comboTimer = Math.max(0, comboTimer - dt);
+  if(comboTimer === 0) combo = 0;
+  for(const g of gems){
+    if(g.got) continue;
+    const dx = g.x - player.x, dy = g.y - player.y;
+    if(dx*dx + dy*dy < (player.r + 14) * (player.r + 14)){
+      const fit = (g.cls === 0) ? (player.r <= 21) : (player.r >= 25);
+      if(fit){
+        g.got = true; gemsGot++; combo++; comboTimer = 3.5;
+        const mult = Math.min(3, 1 + 0.25*(combo-1));
+        score += Math.round(25 * mult);
+        SFX.gem(combo);
+        burst(g.x, g.y, g.cls === 0 ? '#7ee8fa' : '#ffd166', 14, 3.2);
+        shake = Math.min(0.5, shake + 0.12);
+      }
+      /* wrong size: phases through, tiny hint puff */
+      else if(Math.random() < 0.1){ burst(g.x, g.y, '#8892b0', 2, 1.2); }
+    }
+  }
+
+  /* collisions: walls */
+  for(const w of walls){
+    if(w.x > player.x + player.r + 10 || w.x + w.w < player.x - player.r - 10) continue;
+    if(circleRect(player.x, player.y, player.r-1, w.x, -40, w.w, w.top + 40) ||
+       circleRect(player.x, player.y, player.r-1, w.x, w.bot, w.w, H - w.bot + 40)){
+      die(); return;
+    }
+    /* spikes */
+    if(w.spOn === 'top' || w.spikeTop){
+      const sy = w.top, len = w.spikeTop || 0;
+      if(len && circleRect(player.x, player.y, player.r-2, w.x + w.w/2 - 7, sy, 14, len)) { die(); return; }
+    }
+    if(w.spOn === 'bot' || w.spikeBot){
+      const len = w.spikeBot || 0;
+      if(len && circleRect(player.x, player.y, player.r-2, w.x + w.w/2 - 7, w.bot - len, 14, len)) { die(); return; }
+    }
+  }
+  /* ceiling/floor are safe (clamped), keeps focus on walls */
+}
+
+function die(){
+  state = ST.DEAD; deadT = 0; shake = 1;
+  SFX.die();
+  burst(player.x, player.y, '#ff6b8a', 26, 4.5);
+  burst(player.x, player.y, '#ffd166', 12, 3.2);
+  if(score > best){ best = score; try{ localStorage.setItem(BEST_KEY, String(best)); }catch(e){} }
+}
+
+/* ---------- draw ---------- */
+function rr(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+function drawBalloon(x, y, r, sq, air){
+  const sx = r * (2 - sq) * 0.5 + r*0.5, sy = r * sq; /* hmm keep simple below */
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(pressing ? 1 + 0.06*(sq-1) : 1, 1);
+  /* body */
+  const hue = 190 + air * 120;               // cyan -> pink-ish as it inflates
+  const grd = ctx.createRadialGradient(-r*0.3, -r*0.3, r*0.2, 0, 0, r);
+  grd.addColorStop(0, `hsla(${hue},90%,75%,0.95)`);
+  grd.addColorStop(1, `hsla(${hue},80%,52%,0.9)`);
+  ctx.fillStyle = grd;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
+  /* shine */
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.beginPath(); ctx.ellipse(-r*0.35, -r*0.4, r*0.22, r*0.13, -0.6, 0, Math.PI*2); ctx.fill();
+  /* knot + string */
+  ctx.fillStyle = `hsla(${hue},80%,60%,0.9)`;
+  ctx.beginPath(); ctx.moveTo(-4, r-2); ctx.lineTo(4, r-2); ctx.lineTo(0, r+6); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(0, r+6);
+  ctx.quadraticCurveTo(Math.sin(frame*0.08)*6, r+16, 0, r+26); ctx.stroke();
+  ctx.restore();
+}
+function drawWall(w){
+  ctx.fillStyle = '#1c2b4a';
+  ctx.strokeStyle = '#31456f'; ctx.lineWidth = 2;
+  /* top */
+  rr(w.x, -10, w.w, w.top + 10, 6); ctx.fill(); ctx.stroke();
+  /* bottom */
+  rr(w.x, w.bot, w.w, H - w.bot + 10, 6); ctx.fill(); ctx.stroke();
+  /* spikes */
+  ctx.fillStyle = '#ff6b8a';
+  const drawSp = (bx, by, dir, len) => {
+    ctx.beginPath();
+    ctx.moveTo(bx - 7, by); ctx.lineTo(bx + 7, by);
+    ctx.lineTo(bx, by + dir*len); ctx.closePath(); ctx.fill();
+  };
+  if(w.spikeTop && w.spOn === 'top') drawSp(w.x + w.w/2, w.top, 1, w.spikeTop);
+  if(w.spikeBot && w.spOn === 'bot') drawSp(w.x + w.w/2, w.bot, -1, w.spikeBot);
+}
+function drawGem(g){
+  const pulse = 1 + Math.sin(frame*0.1 + g.t) * 0.08;
+  ctx.save(); ctx.translate(g.x, g.y + Math.sin(frame*0.06 + g.t)*3); ctx.scale(pulse, pulse);
+  if(g.cls === 0){ /* small gem — diamond, cyan */
+    ctx.fillStyle = 'rgba(126,232,250,0.95)';
+    ctx.strokeStyle = '#dff7ff'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0,-11); ctx.lineTo(9,0); ctx.lineTo(0,11); ctx.lineTo(-9,0); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+  } else { /* big gem — hexagon, gold */
+    ctx.fillStyle = 'rgba(255,209,102,0.95)';
+    ctx.strokeStyle = '#fff3d6'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for(let i = 0; i < 6; i++){ const a = i/6*Math.PI*2 - Math.PI/2; const px = Math.cos(a)*13, py = Math.sin(a)*13; i?ctx.lineTo(px,py):ctx.moveTo(px,py); }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+function draw(){
+  ctx.save();
+  if(shake > 0){ ctx.translate((Math.random()-0.5)*shake*14, (Math.random()-0.5)*shake*14); }
+  /* sky */
+  const sky = ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0, '#0b1020'); sky.addColorStop(1, '#14213d');
+  ctx.fillStyle = sky; ctx.fillRect(-10, -10, W+20, H+20);
+  /* ambient bubbles */
+  ctx.fillStyle = 'rgba(126,232,250,0.10)';
+  for(const b of bubbles){ ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2); ctx.fill(); }
+
+  if(state === ST.MENU){
+    drawBalloon(W/2, H*0.34 + Math.sin(frame*0.05)*8, 30, 1, 0.7);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#e6f1ff';
+    ctx.font = 'bold 46px "Segoe UI",sans-serif';
+    ctx.fillText('PUFF', W/2, H*0.52);
+    ctx.font = '15px "Segoe UI",sans-serif';
+    ctx.fillStyle = '#9fb3d1';
+    ctx.fillText('HOLD = inflate & rise    RELEASE = deflate & sink', W/2, H*0.60);
+    ctx.fillText('small ◆ gems need a SMALL balloon', W/2, H*0.645);
+    ctx.fillText('big ⬢ gems need a BIG balloon', W/2, H*0.685);
+    if(Math.floor(frame/30) % 2 === 0){
+      ctx.fillStyle = '#7ee8fa';
+      ctx.font = 'bold 18px "Segoe UI",sans-serif';
+      ctx.fillText('HOLD TO START', W/2, H*0.78);
+    }
+    if(best > 0){ ctx.fillStyle = '#ffd166'; ctx.font = '14px "Segoe UI",sans-serif'; ctx.fillText('BEST ' + best, W/2, H*0.84); }
+    ctx.restore(); return;
+  }
+
+  for(const w of walls) drawWall(w);
+  for(const g of gems) drawGem(g);
+
+  /* combo meter */
+  if(combo > 1 && state === ST.PLAY){
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,209,102,0.9)';
+    ctx.font = 'bold 16px "Segoe UI",sans-serif';
+    ctx.fillText('COMBO x' + combo, W/2, 86);
+    ctx.fillStyle = 'rgba(255,209,102,0.35)';
+    ctx.fillRect(W/2-40, 94, 80*(comboTimer/3.5), 3);
+  }
+
+  drawBalloon(player.x, player.y, player.r, player.sq, player.air);
+
+  /* particles */
+  for(const p of parts){
+    ctx.globalAlpha = 1 - p.t/p.life;
+    ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  /* HUD */
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#e6f1ff'; ctx.font = 'bold 26px "Segoe UI",sans-serif';
+  ctx.fillText(String(score), 16, 40);
+  ctx.fillStyle = '#9fb3d1'; ctx.font = '13px "Segoe UI",sans-serif';
+  ctx.fillText('BEST ' + best, 16, 62);
+  /* size meter */
+  const mw = 90, mx = W - mw - 16, my = 22;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  rr(mx, my, mw, 10, 5); ctx.fill();
+  const hue = 190 + player.air * 120;
+  ctx.fillStyle = `hsl(${hue},85%,62%)`;
+  rr(mx, my, Math.max(6, mw * player.air), 10, 5); ctx.fill();
+  ctx.fillStyle = '#9fb3d1'; ctx.font = '10px "Segoe UI",sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('SIZE', mx + mw/2, my + 24);
+
+  if(state === ST.DEAD){
+    ctx.fillStyle = 'rgba(11,16,32,0.55)'; ctx.fillRect(-10, -10, W+20, H+20);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff6b8a'; ctx.font = 'bold 34px "Segoe UI",sans-serif';
+    ctx.fillText('POP!', W/2, H*0.40);
+    ctx.fillStyle = '#e6f1ff'; ctx.font = 'bold 22px "Segoe UI",sans-serif';
+    ctx.fillText('SCORE ' + score, W/2, H*0.48);
+    if(score >= best && score > 0){
+      ctx.fillStyle = '#ffd166'; ctx.font = 'bold 16px "Segoe UI",sans-serif';
+      ctx.fillText('★ NEW BEST ★', W/2, H*0.535);
+    } else {
+      ctx.fillStyle = '#9fb3d1'; ctx.font = '14px "Segoe UI",sans-serif';
+      ctx.fillText('BEST ' + best, W/2, H*0.535);
+    }
+    ctx.fillStyle = '#9fb3d1'; ctx.font = '13px "Segoe UI",sans-serif';
+    ctx.fillText('gems matched: ' + gemsGot, W/2, H*0.60);
+    if(deadT > 0.45 && Math.floor(frame/25) % 2 === 0){
+      ctx.fillStyle = '#7ee8fa'; ctx.font = 'bold 18px "Segoe UI",sans-serif';
+      ctx.fillText('TAP TO RETRY', W/2, H*0.70);
+    }
+  }
+  ctx.restore();
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
