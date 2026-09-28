@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>磁索 MAGNETO</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧲</text></svg>">
+<style>
+html,body{margin:0;padding:0;background:#0b1020;height:100%;overflow:hidden}
+canvas{display:block;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* ============================================================
+   磁索 MAGNETO — 按住吸附 · 松手甩出 · 荡得越远分越高
+   单文件 · 零依赖 · 本地运行
+   ============================================================ */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1, S = 1, VW = 0; // S: 设计高度800的缩放; VW: 设计宽
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';   // 画布逻辑尺寸须锁回视口，否则按 W*DPR 像素显示会被放大裁切
+  S = H / 800; VW = W / S;
+}
+addEventListener('resize', resize); resize();
+
+const TAU = Math.PI * 2, CEIL = 56, FLOOR = 744;
+const G = 1400, BALL_R = 12, ATTACH_R = 175, LMIN = 100, LMAX = 210,
+      THRUST = 260, VMAX = 980, LAUNCH = 1.04, FRAY = 3.5, WARN = 2.3;
+const MILES = [50, 100, 200, 300, 500, 800, 1200];
+
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+let R = Math.random;                      // 生成用随机（可换种子）
+function rr(a, b) { return a + R() * (b - a); }
+function mulberry32(s) { return function () { s |= 0; s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/* ---------------- 音频（WebAudio 实时合成，无文件） ---------------- */
+let AC = null, NBUF = null;
+function ac() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; } }
+  if (AC && AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(f0, f1, dur, type, vol, delay) {
+  const a = ac(); if (!a) return;
+  const t = a.currentTime + (delay || 0);
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(Math.max(1, f0), t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+  g.gain.setValueAtTime(vol || 0.2, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(a.destination); o.start(t); o.stop(t + dur + 0.03);
+}
+function noise(dur, f0, f1, vol, delay) {
+  const a = ac(); if (!a) return;
+  if (!NBUF) {
+    NBUF = a.createBuffer(1, a.sampleRate, a.sampleRate);
+    const d = NBUF.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const t = a.currentTime + (delay || 0);
+  const src = a.createBufferSource(); src.buffer = NBUF; src.loop = true;
+  const bp = a.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.1;
+  bp.frequency.setValueAtTime(f0, t);
+  bp.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  const g = a.createGain();
+  g.gain.setValueAtTime(vol || 0.2, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(bp).connect(g).connect(a.destination); src.start(t); src.stop(t + dur + 0.03);
+}
+const sAttach  = () => { tone(320, 150, 0.06, 'square', 0.16); noise(0.05, 3000, 1200, 0.08); };
+const sRelease = () => noise(0.14, 600, 2600, 0.14);
+const sPickup  = (c) => { const f = 520 * Math.pow(1.13, Math.min(c, 10)); tone(f, f * 1.5, 0.09, 'sine', 0.15); tone(f * 2, f * 2, 0.05, 'sine', 0.05); };
+const sRepel   = () => tone(150, 340, 0.16, 'sine', 0.18);
+const sWhiff   = () => tone(140, 90, 0.05, 'square', 0.07);
+const sTick    = () => tone(1500, 1500, 0.02, 'square', 0.05);
+const sStart   = () => noise(0.2, 300, 1800, 0.1);
+const sMile    = () => { tone(660, 990, 0.12, 'triangle', 0.16); tone(990, 1320, 0.14, 'triangle', 0.12, 0.1); };
+const sDeath   = () => { noise(0.35, 1800, 120, 0.28); tone(160, 36, 0.42, 'sawtooth', 0.22); };
+
+/* ---------------- 状态 ---------------- */
+let mode = 'menu';
+const P = { x: 0, y: 0, vx: 0, vy: 0, att: null, trail: [] };
+let studs = [], nugs = [], saws = [], pops = [], parts = [];
+let camX = 0, shake = 0, slow = 1, runT = 0;
+let meters = 0, gold = 0, combo = 0, comboT = 0, maxCombo = 0, nextMile = 0;
+let genX = 0, genYf = 0.5, prevYf = 0.5;
+const startX = 200;
+let best = { m: 0, g: 0 };
+try { best = JSON.parse(localStorage.getItem('magneto_best_v1')) || best; } catch (e) {}
+let deadInfo = null, pressArmed = true, deaths = 0;
+const Q = new URLSearchParams(location.search);
+const AUTO = Q.has('autotest'), SHOT = Q.get('shot');
+
+/* ---------------- 关卡生成（保底伪随机） ---------------- */
+function metersAt(x) { return Math.max(0, Math.floor((x - startX) / 50)); }
+function genTo(xEnd) {
+  while (genX < xEnd) {
+    const m = metersAt(genX);
+    const gap = (rr(150, 210) + Math.min(m / 40, 1) * 150 + Math.min(m / 200, 1) * 40);
+    const midX = genX + gap / 2;
+    const midY = lerp(prevYf, genYf, 0.5) * 800;
+    genX += gap;
+    prevYf = genYf;
+    genYf = clamp(genYf + rr(-0.22, 0.22), 0.24, 0.74);
+    const kind = (m > 15 && R() < 0.14) ? 'r' : 'n';
+    studs.push({ x: genX, y: genYf * 800, kind, ph: rr(0, TAU), keep: genX < 750 });
+    if (R() < 0.62) {
+      const k = R() < 0.3 ? 2 : 1;
+      for (let i = 0; i < k; i++)
+        nugs.push({ x: midX + rr(-40, 40), y: clamp(midY + rr(-90, 90), 190, 650), ph: rr(0, TAU), fx: false, got: false });
+    }
+    if (m > 60 && R() < Math.min(0.8, 0.3 + m / 500)) {
+      saws.push({
+        x: midX + rr(-50, 50),
+        y: clamp(midY + (R() < 0.5 ? -1 : 1) * rr(90, 190), 170, 690),
+        sp: rr(2, 3.4) * (R() < 0.5 ? -1 : 1),
+        amp: m > 150 ? rr(50, 95) : 0, ph: rr(0, TAU)
+      });
+    }
+  }
+}
+function prune() {
+  while (studs.length && studs[0].x < camX - 500) studs.shift();
+  while (nugs.length && (nugs[0].got || nugs[0].x < camX - 400)) nugs.shift();
+  while (saws.length && saws[0].x < camX - 400) saws.shift();
+}
+
+/* ---------------- 核心动作 ---------------- */
+function reset(seed) {
+  R = (seed != null) ? mulberry32(seed) : Math.random;
+  studs = []; nugs = []; saws = []; pops = []; parts = [];
+  P.x = 170; P.y = 330; P.vx = 240; P.vy = 0; P.att = null; P.trail = [];
+  runT = 0; meters = 0; gold = 0; combo = 0; comboT = 0; maxCombo = 0; nextMile = 0;
+  genX = 300; genYf = 0.54; prevYf = 0.54;
+  studs.push({ x: genX, y: genYf * 800, kind: 'n', ph: 0, keep: true });   // 出生锚点：按住即吸，可复用
+  deadInfo = null; shake = 0; slow = 1;
+  camX = P.x - VW * 0.32;
+  genTo(camX + VW + 500);
+  mode = 'play';
+}
+function tryAttach() {
+  let bs = null, bd = 1e9, rep = null, rd = 1e9;
+  for (const s of studs) {
+    if (s.used) continue;
+    const d = Math.hypot(s.x - P.x, s.y - P.y) - (s.x > P.x ? 40 : 0);   // 偏好前方锚点
+    if (s.kind === 'r') { if (d < rd) { rd = d; rep = s; } }
+    else if (d < bd) { bd = d; bs = s; }
+  }
+  if (rep && rd < 130 && (!bs || rd < bd)) {           // 斥力锚：弹开 = 免费助推
+    const dx = P.x - rep.x, dy = P.y - rep.y, d = Math.hypot(dx, dy) || 1;
+    P.vx += dx / d * 280; P.vy += dy / d * 280 - 120;
+    burst(rep.x, rep.y, '#ff5d5d', 10); sRepel();
+    pops.push({ x: rep.x, y: rep.y - 30, txt: '斥力！', t: 0, col: '#ff5d5d' });
+    return;
+  }
+  if (bs && bd < ATTACH_R * (Math.hypot(P.vx, P.vy) > 500 ? 1.15 : 1)) {  // 高速坠落磁吸容差
+    const d = Math.hypot(bs.x - P.x, bs.y - P.y);
+    P.att = { x: bs.x, y: bs.y, len: clamp(d, LMIN, LMAX), t: 0, s: bs };
+    burst(P.x, P.y, '#57e6ff', 8); sAttach();
+  } else {                                              // 落空
+    pops.push({ x: P.x, y: P.y - 26, txt: '落空', t: 0, col: '#8fa3c8' });
+    sWhiff();
+  }
+}
+function detach(fray) {
+  if (!P.att) return;
+  P.vx *= LAUNCH; P.vy *= LAUNCH;
+  P.att = null;
+  if (fray) { noise(0.1, 2500, 800, 0.12); sWhiff(); } else sRelease();
+}
+function die(cause, near) {
+  if (mode !== 'play') return;
+  mode = 'dead'; deaths++;
+  if (meters > best.m || (meters === best.m && gold > best.g)) {
+    best = { m: meters, g: gold };
+    try { localStorage.setItem('magneto_best_v1', JSON.stringify(best)); } catch (e) {}
+  }
+  let nm = null;
+  for (const M of MILES) if (meters < M) { nm = M; break; }
+  deadInfo = { cause, m: meters, g: gold, near: !!near, next: nm };
+  window._lastCause = cause;
+  const cs = (window._causes = window._causes || {});
+  cs[cause] = (cs[cause] || 0) + 1;
+  window._runs = (window._runs || 0) + 1;
+  window._dp = (P.x | 0) + ',' + (P.y | 0);
+  window._rel = P.rels || 0;
+  P.rels = 0;
+  burst(P.x, P.y, '#ffffff', 30); burst(P.x, P.y, '#ff9d5d', 16);
+  shake = 1; slow = 0.25; sDeath();
+}
+
+/* ---------------- 物理 ---------------- */
+function physics(dt) {
+  runT += dt;
+  comboT -= dt; if (comboT <= 0) combo = 0;
+  // 斥力锚被动场（仅自由飞行时）
+  if (!P.att) {
+    for (const s of studs) {
+      if (s.kind !== 'r') continue;
+      const dx = P.x - s.x, dy = P.y - s.y, d = Math.hypot(dx, dy);
+      if (d < 150 && d > 1) {
+        const f = 2600 * (1 - d / 150);
+        P.vx += dx / d * f * dt; P.vy += dy / d * f * dt;
+      }
+    }
+  }
+  P.vy += G * dt;
+  P.x += P.vx * dt; P.y += P.vy * dt;
+  const sp = Math.hypot(P.vx, P.vy);
+  if (sp > VMAX) { P.vx *= VMAX / sp; P.vy *= VMAX / sp; }
+  if (P.att) {                                             // 刚杆约束：弧线完全可读
+    P.att.len = Math.min(P.att.len, FLOOR - 30 - P.att.y);  // 索回收：低锚点摆弧不扫地板
+    let dx = P.x - P.att.x, dy = P.y - P.att.y;
+    let d = Math.hypot(dx, dy) || 1;
+    const nx = dx / d, ny = dy / d;
+    P.x = P.att.x + nx * P.att.len; P.y = P.att.y + ny * P.att.len;
+    const vr = P.vx * nx + P.vy * ny;
+    P.vx -= vr * nx; P.vy -= vr * ny;                      // 清除径向速度，保留切向
+    P.vx += ny * THRUST * dt; P.vy += -nx * THRUST * dt;   // 前进偏置磁泵（永远向右进展）
+    P.att.t += dt;                                         // 索耗损：滴答预警→崩断
+    if (P.att.t > WARN && (P.att.t % 0.4) < dt) { sTick(); burst(P.att.x, P.att.y, '#ffb347', 3); }
+    if (P.att.t > FRAY) detach(true);
+  }
+  P.trail.push({ x: P.x, y: P.y });
+  if (P.trail.length > 16) P.trail.shift();
+  // 金屑：磁吸 + 收集
+  for (const n of nugs) {
+    if (n.got) continue;
+    const dx = P.x - n.x, dy = P.y - n.y, d = Math.hypot(dx, dy);
+    if (n.fx) {
+      n.x += (P.x - n.x) * 10 * dt; n.y += (P.y - n.y) * 10 * dt;
+      if (d < 24) {
+        n.got = true; gold++; combo++; comboT = 2;
+        maxCombo = Math.max(maxCombo, combo);
+        sPickup(combo);
+        pops.push({ x: n.x, y: n.y - 18, txt: combo > 1 ? '★×' + combo : '★', t: 0, col: '#ffd257' });
+      }
+    } else if (d < 95) { n.fx = true; }
+  }
+  genTo(camX + VW + 500);
+  // 碰撞
+  if (P.y > FLOOR - 10) return die('floor');
+  if (P.y < CEIL + 10) return die('ceil');
+  for (const sw of saws) {
+    const cy = sw.y + (sw.amp ? Math.sin(runT * 1.3 + sw.ph) * sw.amp : 0);
+    const d = Math.hypot(P.x - sw.x, P.y - cy);
+    if (d < 26 + BALL_R) { die('saw', d < 26 + BALL_R + 55); return; }
+  }
+  // 相机 / 里程 / 里程碑
+  camX = lerp(camX, P.x - VW * 0.32, Math.min(1, dt * 5));
+  meters = Math.max(meters, metersAt(P.x));
+  while (nextMile < MILES.length && meters >= MILES[nextMile]) {
+    pops.push({ x: P.x, y: P.y - 46, txt: MILES[nextMile] + 'm !', t: 0, col: '#7dffb0', big: true });
+    sMile(); nextMile++;
+  }
+  prune();
+}
+
+/* ---------------- 粒子 ---------------- */
+function burst(x, y, col, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU, v = 60 + Math.random() * 240;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.5 + Math.random() * 0.4, t: 0, col, r: 1.5 + Math.random() * 2.5 });
+  }
+}
+function stepParts(dt) {
+  for (const p of parts) { p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt; }
+  parts = parts.filter(p => p.t < p.life);
+  for (const q of pops) q.t += dt;
+  pops = pops.filter(q => q.t < 1);
+}
+
+/* ---------------- 输入 ---------------- */
+function down() {
+  ac();                                             // 解锁音频
+  if (mode === 'menu') { sStart(); reset(null); tryAttach(); return; }
+  if (mode === 'dead') { if (pressArmed) { sStart(); reset(null); tryAttach(); } return; }
+  if (mode === 'play' && !P.att) tryAttach();
+}
+function up() {
+  pressArmed = true;
+  if (mode === 'play' && P.att) { P.rels = (P.rels || 0) + 1; detach(false); }
+}
+addEventListener('pointerdown', e => { e.preventDefault(); down(); });
+addEventListener('pointerup', up);
+addEventListener('pointercancel', up);
+addEventListener('keydown', e => { if (!e.repeat && e.code === 'Space') down(); });
+addEventListener('keyup', e => { if (e.code === 'Space') up(); });
+addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------------- 渲染 ---------------- */
+function drawSpikes(yTop, flip) {
+  ctx.fillStyle = '#141c33';
+  ctx.fillRect(camX - 60, flip ? -80 : yTop, VW + 120, 80);
+  const step = 34;
+  ctx.fillStyle = '#2a3550';
+  ctx.beginPath();
+  const x0 = Math.floor((camX - 60) / step) * step;
+  for (let x = x0; x < camX + VW + 60; x += step) {
+    if (flip) { ctx.moveTo(x, yTop); ctx.lineTo(x + step / 2, yTop + 14); ctx.lineTo(x + step, yTop); }
+    else { ctx.moveTo(x, yTop); ctx.lineTo(x + step / 2, yTop - 14); ctx.lineTo(x + step, yTop); }
+  }
+  ctx.fill();
+  ctx.strokeStyle = '#3b4a75'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(camX - 60, yTop); ctx.lineTo(camX + VW + 60, yTop); ctx.stroke();
+}
+function drawWorld() {
+  // 视差星点
+  for (let L = 0; L < 2; L++) {
+    const px = camX * (0.25 + L * 0.25), gap = 190 - L * 60;
+    ctx.fillStyle = L ? 'rgba(120,150,210,0.10)' : 'rgba(90,120,180,0.07)';
+    const x0 = Math.floor(px / gap) * gap;
+    for (let x = x0; x < px + VW + gap; x += gap)
+      for (let y = 90 + (x / gap % 3) * 200; y < FLOOR; y += 260)
+        ctx.fillRect(x - px + camX - 2, y, 3.5, 3.5);
+  }
+  drawSpikes(FLOOR, false);
+  drawSpikes(CEIL, true);
+  // 锚点
+  for (const s of studs) {
+    const inR = mode === 'play' && Math.hypot(s.x - P.x, s.y - P.y) < ATTACH_R;
+    if (s.kind === 'r') {
+      ctx.strokeStyle = 'rgba(255,93,93,0.22)'; ctx.lineWidth = 2; ctx.setLineDash([6, 7]);
+      ctx.beginPath(); ctx.arc(s.x, s.y, 26, 0, TAU); ctx.stroke(); ctx.setLineDash([]);
+      ctx.strokeStyle = '#ff5d5d'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(s.x, s.y, 13, 0, TAU); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(s.x - 6, s.y - 6); ctx.lineTo(s.x + 6, s.y + 6);
+      ctx.moveTo(s.x + 6, s.y - 6); ctx.lineTo(s.x - 6, s.y + 6); ctx.stroke();
+    } else if (s.used) {
+      ctx.fillStyle = '#10182b'; ctx.strokeStyle = '#33405c'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(s.x, s.y, 13, 0, TAU); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#22304c';
+      ctx.beginPath(); ctx.arc(s.x, s.y, 4.5, 0, TAU); ctx.fill();
+    } else {
+      if (inR) {
+        const pu = 0.5 + 0.5 * Math.sin(runT * 6);
+        ctx.strokeStyle = 'rgba(87,230,255,' + (0.15 + pu * 0.25) + ')'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(s.x, s.y, 20 + pu * 5, 0, TAU); ctx.stroke();
+      }
+      ctx.fillStyle = '#0b1020'; ctx.strokeStyle = '#57e6ff'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(s.x, s.y, 13, 0, TAU); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#bff4ff';
+      ctx.beginPath(); ctx.arc(s.x, s.y, 4.5, 0, TAU); ctx.fill();
+    }
+  }
+  // 锯轮
+  for (const sw of saws) {
+    const cy = sw.y + (sw.amp ? Math.sin(runT * 1.3 + sw.ph) * sw.amp : 0);
+    ctx.save(); ctx.translate(sw.x, cy); ctx.rotate(runT * sw.sp);
+    ctx.fillStyle = '#99a3b8';
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = i / 8 * TAU;
+      ctx.moveTo(Math.cos(a) * 20, Math.sin(a) * 20);
+      ctx.lineTo(Math.cos(a + 0.18) * 31, Math.sin(a + 0.18) * 31);
+      ctx.lineTo(Math.cos(a + 0.44) * 31, Math.sin(a + 0.44) * 31);
+      ctx.lineTo(Math.cos(a + 0.62) * 20, Math.sin(a + 0.62) * 20);
+    }
+    ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 0, 22, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#39415a';
+    ctx.beginPath(); ctx.arc(0, 0, 8, 0, TAU); ctx.fill();
+    ctx.restore();
+    if (sw.amp) {
+      ctx.strokeStyle = 'rgba(255,210,87,0.10)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 8]);
+      ctx.beginPath(); ctx.moveTo(sw.x, sw.y - sw.amp); ctx.lineTo(sw.x, sw.y + sw.amp); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+  // 金屑
+  for (const n of nugs) {
+    if (n.got) continue;
+    const by = n.y + (n.fx ? 0 : Math.sin(runT * 2 + n.ph) * 5);
+    ctx.save(); ctx.translate(n.x, by); ctx.rotate(Math.sin(runT * 1.5 + n.ph) * 0.4);
+    ctx.fillStyle = '#ffd257';
+    ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(7, 0); ctx.lineTo(0, 9); ctx.lineTo(-7, 0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath(); ctx.moveTo(0, -4); ctx.lineTo(3, 0); ctx.lineTo(0, 4); ctx.lineTo(-3, 0); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  // 磁索
+  if (P.att) {
+    const t = P.att.t;
+    const col = t < WARN ? '#57e6ff' : (t < WARN + 0.9 ? '#ffb347' : '#ff5d5d');
+    const wob = Math.sin(runT * 20) * 4 * Math.max(0, 1 - t / FRAY);
+    ctx.strokeStyle = col; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(P.att.x, P.att.y);
+    ctx.quadraticCurveTo((P.att.x + P.x) / 2 + wob, (P.att.y + P.y) / 2, P.x, P.y);
+    ctx.stroke();
+  }
+  // 粒子
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, 1 - p.t / p.life);
+    ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // 球（拖尾）
+  for (let i = 0; i < P.trail.length; i++) {
+    const tr = P.trail[i], a = i / P.trail.length;
+    ctx.fillStyle = 'rgba(190,240,255,' + (a * 0.25) + ')';
+    ctx.beginPath(); ctx.arc(tr.x, tr.y, 2 + a * 6, 0, TAU); ctx.fill();
+  }
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(P.x, P.y, BALL_R, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(120,220,255,0.5)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(P.x, P.y, BALL_R + 5, 0, TAU); ctx.stroke();
+  // 浮字
+  for (const q of pops) {
+    ctx.globalAlpha = Math.max(0, 1 - q.t);
+    ctx.fillStyle = q.col || '#e8f4ff';
+    ctx.font = (q.big ? 'bold 30px' : 'bold 18px') + ' system-ui,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(q.txt, q.x, q.y - q.t * 40);
+  }
+  ctx.globalAlpha = 1;
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function drawHUD() {
+  ctx.save();
+  ctx.translate(-camX, 0);            // HUD 坐标按相机窗口书写，先平移回屏幕空间，否则随相机漂移出屏
+  ctx.textAlign = 'center';
+  if (mode !== 'menu') {
+    ctx.fillStyle = '#e8f4ff'; ctx.font = 'bold 46px system-ui,sans-serif';
+    ctx.fillText(meters + 'm', camX + VW / 2, 64);
+    ctx.fillStyle = '#8fa3c8'; ctx.font = '15px system-ui,sans-serif';
+    ctx.fillText('最佳 ' + best.m + 'm', camX + VW / 2, 88);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ffd257'; ctx.font = 'bold 24px system-ui,sans-serif';
+    ctx.fillText('★ ' + gold, camX + VW - 24, 54);
+    if (combo > 1 && comboT > 0) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#57e6ff'; ctx.fillText('连击 ×' + combo, camX + 24, 54);
+    }
+  }
+  if (mode === 'menu') {
+    ctx.fillStyle = 'rgba(5,8,18,0.6)'; ctx.fillRect(camX, 0, VW, 800);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#e8f4ff'; ctx.font = 'bold 92px system-ui,sans-serif';
+    ctx.fillText('磁 索', camX + VW / 2, 250);
+    ctx.fillStyle = '#57e6ff'; ctx.font = 'bold 30px monospace';
+    ctx.fillText('M A G N E T O', camX + VW / 2, 300);
+    ctx.fillStyle = '#b9c8e6'; ctx.font = '20px system-ui,sans-serif';
+    ctx.fillText('按住 = 磁索吸附最近锚点 · 松手 = 沿弧线甩出', camX + VW / 2, 372);
+    ctx.fillText('荡得越远分越高 · 金屑连击加成 · 红锚斥力=免费助推', camX + VW / 2, 404);
+    ctx.fillStyle = '#8fa3c8'; ctx.font = '17px system-ui,sans-serif';
+    ctx.fillText('锚点吸过即熄 · 索挂太久会崩断', camX + VW / 2, 436);
+    if (best.m > 0) {
+      ctx.fillStyle = '#ffd257'; ctx.font = 'bold 22px system-ui,sans-serif';
+      ctx.fillText('最佳 ' + best.m + 'm · ★' + best.g, camX + VW / 2, 492);
+    }
+    ctx.fillStyle = 'rgba(232,244,255,' + (0.55 + 0.45 * Math.sin(runT * 4)) + ')';
+    ctx.font = 'bold 26px system-ui,sans-serif';
+    ctx.fillText('— 点按任意处开始 —', camX + VW / 2, 560);
+    if (VW < 560) {
+      ctx.fillStyle = '#8fa3c8'; ctx.font = '15px system-ui,sans-serif';
+      ctx.fillText('↻ 横屏体验更佳', camX + VW / 2, 600);
+    }
+  }
+  if (mode === 'dead' && deadInfo) {
+    ctx.fillStyle = 'rgba(5,8,18,0.66)'; ctx.fillRect(camX, 0, VW, 800);
+    const cx = camX + VW / 2, cw = Math.min(420, VW - 60), chh = 330;
+    const cxx = cx - cw / 2, cyy = (800 - chh) / 2;   // 卡片纵向居中于 800 设计高
+    ctx.fillStyle = 'rgba(18,26,48,0.96)';
+    roundRect(cxx, cyy, cw, chh, 18); ctx.fill();
+    ctx.strokeStyle = 'rgba(87,230,255,0.35)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.textAlign = 'center';
+    const causeTxt = { floor: '摔进尖刺堆', ceil: '拍上天花板', saw: '卷进锯轮' }[deadInfo.cause] || '坠了';
+    ctx.fillStyle = '#8fa3c8'; ctx.font = '20px system-ui,sans-serif';
+    ctx.fillText(causeTxt, cx, cyy + 52);
+    ctx.fillStyle = '#e8f4ff'; ctx.font = 'bold 62px system-ui,sans-serif';
+    ctx.fillText(deadInfo.m + 'm', cx, cyy + 124);
+    ctx.fillStyle = '#ffd257'; ctx.font = 'bold 24px system-ui,sans-serif';
+    ctx.fillText('★ ' + deadInfo.g + (maxCombo > 1 ? ' · 最高连击 ×' + maxCombo : ''), cx, cyy + 162);
+    if (deadInfo.near) {
+      ctx.fillStyle = '#ff5d5d'; ctx.font = 'bold 22px system-ui,sans-serif';
+      ctx.fillText('就差一点点！!', cx, cyy + 202);
+    } else if (deadInfo.next) {
+      ctx.fillStyle = '#8fa3c8'; ctx.font = '17px system-ui,sans-serif';
+      ctx.fillText('下一里程碑 ' + deadInfo.next + 'm · 还差 ' + (deadInfo.next - deadInfo.m) + 'm', cx, cyy + 200);
+    }
+    ctx.fillStyle = deadInfo.m >= best.m && deadInfo.m > 0 ? '#7dffb0' : '#b9c8e6';
+    ctx.font = '18px system-ui,sans-serif';
+    ctx.fillText((deadInfo.m >= best.m && deadInfo.m > 0 ? '🏅 新纪录！' : '最佳 ' + best.m + 'm'), cx, cyy + 236);
+    ctx.fillStyle = 'rgba(232,244,255,' + (0.55 + 0.45 * Math.sin(runT * 5)) + ')';
+    ctx.font = 'bold 22px system-ui,sans-serif';
+    ctx.fillText('点按任意处 · 立刻再荡', cx, cyy + 288);
+  }
+  ctx.restore();
+}
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#0b1020'; ctx.fillRect(0, 0, W, H);
+  ctx.setTransform(DPR * S, 0, 0, DPR * S, 0, 0);
+  ctx.save();
+  if (shake > 0) ctx.translate(rr2(-shake * 10, shake * 10), rr2(-shake * 10, shake * 10));
+  ctx.translate(-camX, 0);
+  drawWorld();
+  ctx.restore();
+  drawHUD();
+}
+function rr2(a, b) { return a + Math.random() * (b - a); }
+
+/* ---------------- 主循环 ---------------- */
+let lastT = performance.now(), botT = 0;
+function frame(now) {
+  let dt = (now - lastT) / 1000; lastT = now;
+  if (dt <= 0 || dt > 1) dt = 0.016;
+  const raw = dt;
+  slow = (mode === 'dead') ? Math.min(1, slow + raw * 1.4) : 1;
+  dt *= slow;
+  runT += (mode === 'menu' ? raw : 0);
+  shake = Math.max(0, shake - raw * 2.2);
+  if (mode === 'play') physics(dt);
+  else if (mode === 'dead') { runT += dt; stepParts(dt); }
+  else { stepParts(raw); }
+  if (AUTO) botTick(raw);
+  render();
+}
+function loop(t) { frame(t); requestAnimationFrame(loop); }
+if (AUTO) setInterval(() => frame(performance.now()), 16); else requestAnimationFrame(loop);
+
+/* ---------------- 自动化测试钩子 ---------------- */
+function botTick(dt) {
+  botT += dt;
+  if (mode === 'play') {
+    if (P.att) {
+      // 右下象限上摆段 = 速度朝右上，松手即向前飞（小摆幅也放，防微摆僵局）；耗损将近 → 强制松手
+      if (P.vx > 20 && P.vy < -20 && P.x > P.att.x + 15 && P.y > P.att.y + 5 && Math.hypot(P.vx, P.vy) > 150) { botT = 0; up(); }
+      else if (P.att.t > 3.2) { botT = 0; up(); }
+    } else {
+      if (P.vx > -400) {                                 // 倒飞也试着抓（人类会抓身后锚点自救）
+        let dmin = 1e9;
+        for (const s of studs) if (!s.used) dmin = Math.min(dmin, Math.hypot(s.x - P.x, s.y - P.y));
+        if (dmin < 150) { botT = 0; down(); }
+      }
+    }
+  } else if (mode === 'dead' && botT > 0.9) {
+    botT = 0; down(); setTimeout(up, 150);
+  } else if (mode === 'menu' && botT > 0.4) {
+    botT = 0; down(); setTimeout(up, 150);
+  }
+}
+if (AUTO) {
+  setInterval(() => {
+    let dmin = -1;
+    if (mode === 'play') {
+      dmin = 1e9;
+      for (const s of studs) dmin = Math.min(dmin, Math.hypot(s.x - P.x, s.y - P.y));
+    }
+    document.title = 'st=' + mode + ' m=' + meters + ' g=' + gold + ' d=' + deaths +
+      ' best=' + best.m + ' last=' + (window._lastCause || '-') +
+      ' causes=' + JSON.stringify(window._causes || {}) + ' runs=' + (window._runs || 0) +
+      ' p=' + (P.x | 0) + ',' + (P.y | 0) + ' v=' + (P.vx | 0) + ',' + (P.vy | 0) +
+      ' att=' + (P.att ? (P.att.t).toFixed(1) : 0) + ' dm=' + (dmin > 0 ? dmin | 0 : -1) +
+      ' dp=' + (window._dp || '-') + ' rel=' + (window._rel ?? '-');
+  }, 200);
+}
+if (SHOT) {
+  (function buildShot(name) {
+    if (name === 'play') {
+      reset(7);
+      const s = studs[3] || studs[1];
+      P.x = s.x - 140; P.y = s.y + 150;
+      P.att = { x: s.x, y: s.y, len: clamp(Math.hypot(P.x - s.x, P.y - s.y), LMIN, LMAX), t: 0.8, s };
+      P.vx = 430; P.vy = -140; P.trail = [{ x: P.x - 30, y: P.y + 20 }, { x: P.x - 15, y: P.y + 10 }, { x: P.x, y: P.y }];
+      camX = P.x - VW * 0.32; meters = metersAt(P.x); gold = 6; combo = 3; comboT = 1.4;
+      burst(P.x, P.y, '#57e6ff', 12);
+    } else if (name === 'dead') {
+      reset(11); meters = 87; gold = 6; maxCombo = 4;
+      die('saw', true); shake = 0.4; slow = 0.6;
+    } else {
+      mode = 'menu';
+    }
+    (function still() { render(); requestAnimationFrame(still); })();
+  })(SHOT);
+}
+</script>
+</body>
+</html>
