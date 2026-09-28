@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>回声深渊 Echo Abyss</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#02060e;overflow:hidden;
+    touch-action:none;-webkit-user-select:none;user-select:none;overscroll-behavior:none}
+  #c{display:block;position:absolute;left:0;top:0}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* ============ 回声深渊 Echo Abyss ============
+   点按 = 声呐脉冲 = 上浮 + 照亮。
+   零依赖单文件 HTML5，鼠标/触屏通用。 */
+
+const W = 480, H = 800;            // 逻辑分辨率（竖屏）
+const PX = 140;                    // 玩家固定横向位置
+const GRAV = 900, FLAP = -290, VMAX = 560;
+const SEG = 140;                   // 洞穴控制点间距
+const TAU = Math.PI * 2;
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+// 黑暗遮罩独立层:destination-out 在单画布上打孔会把内容一起擦掉,
+// 必须先在遮罩层上挖好光孔、再整体盖回主画布,光孔里才是完整亮度的世界
+const maskCv = document.createElement('canvas');
+const mctx = maskCv.getContext('2d');
+let dpr = 1, scale = 1, offX = 0, offY = 0;
+
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const ww = window.innerWidth, wh = window.innerHeight;
+  scale = Math.min(ww / W, wh / H);
+  const cw = Math.round(W * scale), ch = Math.round(H * scale);
+  cv.style.width = cw + 'px'; cv.style.height = ch + 'px';
+  cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
+  maskCv.width = cv.width; maskCv.height = cv.height;
+  offX = (ww - cw) / 2; offY = (wh - ch) / 2;
+  // 居中必须落在元素定位上,而不是画布内部变换(否则横屏窗口里内容会被平移出画布)
+  cv.style.left = offX + 'px'; cv.style.top = offY + 'px';
+}
+window.addEventListener('resize', resize); resize();
+
+const rand  = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp  = (a, b, t) => a + (b - a) * t;
+
+/* ---------- WebAudio 合成音效（无音频文件） ---------- */
+const AU = {
+  ctx: null, master: null, muted: false,
+  init(){
+    if (this.ctx) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.5;
+      this.master.connect(this.ctx.destination);
+      // 回声总线（声呐的魂）
+      this.echo = this.ctx.createDelay(1);
+      this.echo.delayTime.value = 0.23;
+      const fb = this.ctx.createGain(); fb.gain.value = 0.34;
+      this.echo.connect(fb); fb.connect(this.echo);
+      const wet = this.ctx.createGain(); wet.gain.value = 0.5;
+      this.echo.connect(wet); wet.connect(this.master);
+      this.ambient();
+    } catch(e){ /* 无音频环境也能玩 */ }
+  },
+  resume(){ if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); },
+  tone(freq, dur, type, vol, slideTo, echo){
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(vol || 0.2, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    if (echo) g.connect(this.echo);
+    o.start(t); o.stop(t + dur + 0.05);
+  },
+  noise(dur, vol, freq){
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    const len = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const f = this.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = freq || 500;
+    const g = this.ctx.createGain(); g.gain.value = vol || 0.4;
+    src.connect(f); f.connect(g); g.connect(this.master); src.start(t);
+  },
+  ping(){ this.tone(1250, 0.28, 'sine', 0.22, 260, true); },
+  pearl(combo){
+    const scale_ = [523, 587, 659, 784, 880, 1046, 1175, 1318];
+    this.tone(scale_[Math.min(combo, 7)], 0.14, 'triangle', 0.2, null, false);
+    this.tone(scale_[Math.min(combo, 7)] * 2, 0.1, 'sine', 0.06);
+  },
+  green(){ this.tone(392, 0.12, 'triangle', 0.2); setTimeout(() => this.tone(523, 0.16, 'triangle', 0.16), 90); },
+  save(){
+    this.tone(660, 0.09, 'square', 0.14);
+    setTimeout(() => this.tone(1046, 0.2, 'triangle', 0.2), 70);
+    setTimeout(() => this.noise(0.18, 0.2, 1200), 50);
+  },
+  crash(){ this.noise(0.35, 0.5, 420); this.tone(120, 0.4, 'sawtooth', 0.3, 38); },
+  best(){ this.tone(660, 0.12, 'square', 0.12); setTimeout(() => this.tone(990, 0.2, 'square', 0.12), 110); },
+  ambient(){
+    if (!this.ctx) return;
+    const len = this.ctx.sampleRate * 2;
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++){ last = (last + (Math.random() * 2 - 1) * 0.02) * 0.995; d[i] = last * 3; }
+    const src = this.ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const f = this.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 140;
+    const g = this.ctx.createGain(); g.gain.value = 0.5;
+    src.connect(f); f.connect(g); g.connect(this.master); src.start();
+  }
+};
+
+/* ---------- 存档 ---------- */
+function loadBest(){ try { return +localStorage.getItem('echoabyss_best') || 0; } catch(e){ return 0; } }
+function saveBest(v){ try { localStorage.setItem('echoabyss_best', v); } catch(e){} }
+
+/* ---------- 游戏状态 ---------- */
+let state = 'menu';           // menu | play | dying | dead
+let best = loadBest();
+let scrollX, speed, tPlay, player, cave, pearls, jellies, pings;
+let parts, floats, trail, plankton, shake, slow, combo, comboT, comboPop;
+let pearlTimer, jellyTimer, score, pearlGot, lastCaveD, deathAt, muted;
+let lives, graceT;                 // 护体绿珠（跟在身后的额外生命）与被救后的无敌时间
+let tutPings = 0;             // 新手引导:前 3 次声呐内持续显示操作提示
+muted = false;
+try { muted = localStorage.getItem('echoabyss_mute') === '1'; } catch(e){}
+
+plankton = [];
+for (let i = 0; i < 26; i++)
+  plankton.push({ x: Math.random() * W, y: Math.random() * H, r: rand(0.8, 2.2), a: rand(0.06, 0.2), sp: rand(4, 14) });
+
+function resetGame(){
+  scrollX = 0; speed = 150; tPlay = 0;
+  player = { y: H * 0.5, vy: 0, r: 12 };
+  cave = { pts: [], lastD: 0 };
+  let wx = -SEG;
+  for (let i = 0; i < 12; i++) pushCave(wx + i * SEG, H * 0.5, H * 0.56);
+  pearls = []; jellies = []; pings = []; parts = []; floats = []; trail = []; lives = [];
+  shake = 0; slow = 0; combo = 0; comboT = 0; comboPop = 0; graceT = 0;
+  pearlTimer = 0.6; jellyTimer = 0; score = 0; pearlGot = 0; tutPings = 0;
+}
+
+function pushCave(wx, cy, gap){
+  // 保底伪随机：限制中心游走幅度，连续同向大步会被压制
+  let d = rand(-1, 1) * 90;
+  if (cave.lastD > 60 && d > 0) d *= 0.3;
+  if (cave.lastD < -60 && d < 0) d *= 0.3;
+  cave.lastD = d;
+  const prev = cave.pts.length ? cave.pts[cave.pts.length - 1].cy : cy;
+  const ncy = clamp(prev + d, 130, H - 130);
+  cave.pts.push({ wx, cy: ncy, gap });
+}
+
+function caveAt(wx){
+  const pts = cave.pts;
+  let i = Math.floor((wx - pts[0].wx) / SEG);
+  i = clamp(i, 0, pts.length - 2);
+  const a = pts[i], b = pts[i + 1];
+  let t = (wx - a.wx) / SEG; t = clamp(t, 0, 1);
+  const s = t * t * (3 - 2 * t);
+  return { cy: lerp(a.cy, b.cy, s), gap: lerp(a.gap, b.gap, s) };
+}
+
+/* ---------- 输入 ---------- */
+function logicalXY(e){
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
+}
+function toggleMute(){
+  muted = !muted;
+  try { localStorage.setItem('echoabyss_mute', muted ? '1' : '0'); } catch(e){}
+  if (!muted){ AU.init(); AU.resume(); AU.pearl(2); }
+}
+function copyResult(){
+  const txt = '🐋 回声深渊 Echo Abyss｜本局 ' + Math.floor(score) + ' 分 · 珍珠 ' +
+    pearlGot + ' 颗 · 下潜 ' + Math.floor(scrollX / 40) + ' 米｜最高 ' + best;
+  const done = () => floats.push({ x: W * 0.36, y: H * 0.28 + 200, txt: '战绩已复制 ✓', age: 1.4 });
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(done).catch(() => { fallbackCopy(txt); done(); });
+  } else { fallbackCopy(txt); done(); }
+}
+function fallbackCopy(t){
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+  } catch(e){}
+}
+function ping(){
+  pings.push({ r: 10, a: 1 });
+  player.vy = FLAP;
+  tutPings++;
+  AU.ping();
+}
+function startRun(){
+  resetGame(); state = 'play';
+  pings.push({ r: 10, a: 1 }); AU.ping();   // 开局送一次声呐:先看一眼深渊再摸黑
+}
+function act(e){
+  AU.init(); AU.resume();
+  if (e){
+    const p = logicalXY(e);
+    if (Math.abs(p.x - (W - 30)) < 26 && Math.abs(p.y - 30) < 26){ toggleMute(); return; }  // 静音钮
+    if (state === 'dead' && p.y > H * 0.28 + 230 && p.y < H * 0.28 + 280 &&
+        Math.abs(p.x - W / 2) < 90){ copyResult(); return; }                                // 复制战绩
+  }
+  if (state === 'menu'){ startRun(); }
+  else if (state === 'play') ping();
+  else if (state === 'dead' && performance.now() - deathAt > 450){ startRun(); }
+}
+cv.addEventListener('pointerdown', e => { e.preventDefault(); act(e); });
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'Enter'){ e.preventDefault(); act(); }
+});
+
+/* ---------- 更新 ---------- */
+// 护体绿珠生效：消耗最近一颗（一颗只救一次），无敌 0.5s 并脱离危险
+function savePlayer(c, jelly, ji){
+  const l = lives.shift();
+  window.__saves = (window.__saves || 0) + 1;
+  for (let i = 0; i < 14; i++){
+    const a = rand(0, TAU), sp = rand(40, 240);
+    parts.push({ x: l.x, y: l.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, age: rand(0.3, 0.8), r: rand(1, 3), c: '#86efac' });
+  }
+  if (jelly && ji !== undefined){                 // 击退肇事水母，否则无敌结束还会撞同一只
+    for (let i = 0; i < 10; i++){
+      const a = rand(0, TAU), sp = rand(30, 180);
+      parts.push({ x: jelly.wx - scrollX, y: jelly.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, age: rand(0.3, 0.6), r: rand(1, 2.5), c: '#c084fc' });
+    }
+    jellies.splice(ji, 1);
+  }
+  floats.push({ x: PX + 26, y: player.y - 30, txt: '💚 护体！', age: 1.2 });
+  graceT = 0.5;                                   // 短暂无敌（本体闪烁提示）
+  player.y += (c.cy - player.y) * 0.6;            // 拉向通道中央方向，避免连续撞壁
+  player.vy = 0;
+  shake = 6;
+  AU.save();
+}
+
+function crash(){
+  state = 'dying'; slow = 0.4; shake = 13;
+  AU.crash();
+  for (let i = 0; i < 42; i++){
+    const a = rand(0, TAU), sp = rand(40, 340);
+    parts.push({ x: PX, y: player.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      age: rand(0.4, 1.1), r: rand(1.5, 4), c: Math.random() < 0.5 ? '#67e8f9' : '#e0f7ff' });
+  }
+  const s = Math.floor(score);
+  if (s > best){ best = s; saveBest(s); AU.best(); player.newBest = true; }
+}
+
+function die(){
+  state = 'dead'; deathAt = performance.now();
+}
+
+function update(dt){
+  // 浮游微粒（所有状态都在漂）
+  for (const p of plankton){
+    p.x -= p.sp * dt; p.y += Math.sin(p.x * 0.02) * 2 * dt;
+    if (p.x < -4){ p.x = W + 4; p.y = Math.random() * H; }
+  }
+  if (state === 'dead' || state === 'menu'){
+    if (state === 'menu'){ scrollX = (scrollX || 0) + 26 * dt; extendCave();
+      while (cave.pts.length > 26) cave.pts.shift(); }
+    updFx(dt); return;
+  }
+  if (state === 'dying'){
+    slow -= dt;
+    updFx(dt);
+    if (slow <= 0) die();
+    return;
+  }
+
+  // ---- 进行中 ----
+  tPlay += dt;
+  speed = 150 + 12 * Math.sqrt(tPlay);                     // 平滑指数爬坡
+  scrollX += speed * dt;
+  score += speed * dt * 0.06;
+
+  // 洞穴收窄：56% → 底 30%，约 104s 到底
+  const gapNow = Math.max(H * 0.30, H * 0.56 - 2.0 * tPlay);
+  extendCave(gapNow);
+  while (cave.pts.length > 26) cave.pts.shift();
+
+  // 玩家物理
+  player.vy = Math.min(player.vy + GRAV * dt, VMAX);
+  player.y += player.vy * dt;
+  trail.push({ x: PX, y: player.y, a: 0.5 });
+  if (trail.length > 18) trail.shift();
+  for (const tr of trail) tr.a *= 0.9;
+
+  graceT = Math.max(0, graceT - dt);
+  // 护体绿珠：链式缓动跟在身后，像一条随轨迹摆动的小尾巴
+  let fx = PX - 24, fy = player.y;
+  for (const l of lives){
+    const k = Math.min(1, 9 * dt);
+    l.x += (fx - l.x) * k; l.y += (fy - l.y) * k;
+    fx = l.x - 21; fy = l.y;
+  }
+
+  // 碰撞：岩壁（有护体珠则免死一次；被救后短暂无敌并拉回通道中央方向）
+  const c = caveAt(scrollX + PX);
+  if (graceT <= 0 && (player.y - player.r < c.cy - c.gap / 2 || player.y + player.r > c.cy + c.gap / 2)){
+    if (lives.length) savePlayer(c);
+    else {
+      const top = player.y - player.r < c.cy - c.gap / 2;
+      window.__death = (top ? 'top' : 'bot') + ' y=' + (player.y | 0) + ' wall=' + ((top ? c.cy - c.gap / 2 : c.cy + c.gap / 2) | 0);
+      crash();
+    }
+  }
+
+  // 珍珠生成：按珍珠自己所在的 x 取洞穴轮廓（不能按玩家 x 算——两处轮廓不同，会落进岩壁）
+  pearlTimer -= dt;
+  if (pearlTimer <= 0){
+    pearlTimer = rand(1.0, 1.8);
+    const pw = scrollX + W + 30;
+    const pc = caveAt(pw);
+    const m = 46;                                             // 离壁保底(> 珍珠半径+浮动动画)
+    const py = clamp(pc.cy + rand(-pc.gap * 0.3, pc.gap * 0.3), pc.cy - pc.gap / 2 + m, pc.cy + pc.gap / 2 - m);
+    pearls.push({ wx: pw, y: py, r: 7, bob: rand(0, TAU), g: Math.random() < 0.03 });   // 3% 概率是护体绿珠
+  }
+  // 水母生成（25s 后出现，数量随时间升到 2 —— 难度爬坡）——同样按自身 x 取轮廓
+  jellyTimer -= dt;
+  if (tPlay > 25 && jellyTimer <= 0 && jellies.length < (tPlay > 75 ? 2 : 1)){
+    jellyTimer = rand(3.5, 6.5);
+    const jw = scrollX + W + 60;
+    const jc = caveAt(jw);
+    const jy = clamp(jc.cy + rand(-60, 60), jc.cy - jc.gap / 2 + 70, jc.cy + jc.gap / 2 - 70);
+    jellies.push({ wx: jw, y0: jy, y: jy, r: 15, ph: rand(0, TAU) });
+  }
+
+  // 珍珠：移动 / 磁吸 / 拾取
+  for (let i = pearls.length - 1; i >= 0; i--){
+    const p = pearls[i];
+    p.bob += dt * 3;
+    const dx = (p.wx - scrollX) - PX, dy = p.y - player.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < 3600){ p.wx -= dx * 6 * dt; p.y -= dy * 6 * dt; p.mt = (p.mt || 0) + dt; }   // 近距磁吸
+    else p.mt = 0;
+    // 拾取:进圈即得;磁吸拉力会被世界滚动抵消,珍珠可能永远悬在拾取圈外"跟而不吃"——纠缠 0.4s 即强制吸收
+    if (d2 < (p.r + player.r + 4) * (p.r + player.r + 4) || (p.mt || 0) > 0.4){
+      pearls.splice(i, 1);
+      if (p.g){                                       // 绿珠：不进连击，化作跟在身后的护体生命
+        lives.push({ x: p.wx - scrollX, y: p.y });
+        floats.push({ x: PX + 26, y: player.y - 28, txt: '💚 护体 +1', age: 1.3 });
+        AU.green();
+        for (let k = 0; k < 10; k++){
+          const a = rand(0, TAU), sp = rand(20, 140);
+          parts.push({ x: PX, y: player.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, age: rand(0.3, 0.6), r: rand(1, 2.5), c: '#86efac' });
+        }
+      } else {
+        pearlGot++;
+        combo = comboT > 0 ? combo + 1 : 1;
+        comboT = 2.5; comboPop = 1.4;
+        const pts = 5 * Math.min(combo, 8);
+        score += pts;
+        floats.push({ x: PX + 20, y: player.y - 18, txt: '+' + pts + (combo > 1 ? '  ×' + Math.min(combo, 8) : ''), age: 1 });
+        AU.pearl(combo - 1);
+        for (let k = 0; k < 8; k++){
+          const a = rand(0, TAU), sp = rand(20, 120);
+          parts.push({ x: PX + dx, y: p.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, age: rand(0.25, 0.5), r: rand(1, 2.5), c: '#ffd166' });
+        }
+      }
+    } else if (p.wx - scrollX < -20){
+      pearls.splice(i, 1);
+      if (comboT > 0) combo = 0;                                 // 漏珠断连击
+    }
+  }
+  comboT = Math.max(0, comboT - dt);
+  comboPop = Math.max(1, comboPop - dt * 2);
+
+  // 水母
+  for (let i = jellies.length - 1; i >= 0; i--){
+    const j = jellies[i];
+    j.wx -= speed * 0.12 * dt;
+    j.ph += dt * 2;
+    j.y = j.y0 + Math.sin(j.ph) * 34;
+    const sx = j.wx - scrollX, sy = j.y;
+    const dx = sx - PX, dy = sy - player.y;
+    if (graceT <= 0 && dx * dx + dy * dy < (j.r + player.r) * (j.r + player.r)){
+      if (lives.length){ savePlayer(c, j, i); continue; }       // 护体珠电弧击退水母
+      window.__death = 'jelly'; crash();
+    }
+    if (sx < -60) jellies.splice(i, 1);
+  }
+
+  updFx(dt);
+}
+
+function extendCave(gapNow){
+  let last = cave.pts[cave.pts.length - 1];
+  while (last.wx < scrollX + W + SEG * 2){
+    const g = gapNow !== undefined ? gapNow : H * 0.56;
+    pushCave(last.wx + SEG, last.cy, g);
+    last = cave.pts[cave.pts.length - 1];
+  }
+}
+
+function updFx(dt){
+  for (let i = pings.length - 1; i >= 0; i--){
+    const p = pings[i];
+    p.r += 900 * dt; p.a = 1 - p.r / 850;
+    if (p.a <= 0) pings.splice(i, 1);
+  }
+  for (let i = parts.length - 1; i >= 0; i--){
+    const p = parts[i];
+    p.age -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 60 * dt;
+    if (p.age <= 0) parts.splice(i, 1);
+  }
+  for (let i = floats.length - 1; i >= 0; i--){
+    const f = floats[i];
+    f.age -= dt * 0.9; f.y -= 26 * dt;
+    if (f.age <= 0) floats.splice(i, 1);
+  }
+  shake = Math.max(0, shake - dt * 26);
+}
+
+/* ---------- 绘制 ---------- */
+function sx(wx){ return wx - scrollX; }
+
+function drawCave(){
+  const pts = cave.pts;
+  const x0 = Math.max(pts[0].wx, scrollX - 20);
+  const step = 16;
+  ctx.fillStyle = '#0a1526';
+  ctx.beginPath();
+  ctx.moveTo(-2, -2);
+  for (let x = x0; x <= scrollX + W + 20; x += step){
+    const c = caveAt(x);
+    ctx.lineTo(sx(x), c.cy - c.gap / 2);
+  }
+  ctx.lineTo(W + 2, -2); ctx.closePath(); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-2, H + 2);
+  for (let x = x0; x <= scrollX + W + 20; x += step){
+    const c = caveAt(x);
+    ctx.lineTo(sx(x), c.cy + c.gap / 2);
+  }
+  ctx.lineTo(W + 2, H + 2); ctx.closePath(); ctx.fill();
+  // 岩壁荧光边（声呐扫过时的主要空间信息）
+  ctx.strokeStyle = 'rgba(86,164,208,0.62)'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let x = x0; x <= scrollX + W + 20; x += step){
+    const c = caveAt(x);
+    const y = c.cy - c.gap / 2;
+    x === x0 ? ctx.moveTo(sx(x), y) : ctx.lineTo(sx(x), y);
+  }
+  ctx.stroke();
+  ctx.beginPath();
+  for (let x = x0; x <= scrollX + W + 20; x += step){
+    const c = caveAt(x);
+    const y = c.cy + c.gap / 2;
+    x === x0 ? ctx.moveTo(sx(x), y) : ctx.lineTo(sx(x), y);
+  }
+  ctx.stroke();
+}
+
+function drawJelly(j){
+  const x = sx(j.wx), y = j.y;
+  const sq = 1 + Math.sin(j.ph * 2) * 0.12;
+  ctx.save(); ctx.translate(x, y);
+  const g = ctx.createRadialGradient(0, 0, 2, 0, 0, 30);
+  g.addColorStop(0, 'rgba(192,132,252,0.5)'); g.addColorStop(1, 'rgba(192,132,252,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 30, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#c084fc';
+  ctx.beginPath(); ctx.ellipse(0, 0, j.r / sq, j.r * sq, 0, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(192,132,252,0.75)'; ctx.lineWidth = 2;
+  for (let k = -1; k <= 1; k++){
+    ctx.beginPath(); ctx.moveTo(k * 7, j.r * 0.7);
+    ctx.quadraticCurveTo(k * 7 + Math.sin(j.ph * 2 + k) * 7, j.r + 10, k * 7 + Math.sin(j.ph * 2 + k) * 10, j.r + 20);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#1a0b2e';
+  ctx.beginPath(); ctx.arc(-4, -3, 2, 0, TAU); ctx.arc(4, -3, 2, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+function draw(){
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  // 背景
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#04101f'); bg.addColorStop(1, '#02060e');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  if (shake > 0){
+    ctx.translate(rand(-shake, shake), rand(-shake, shake));
+  }
+  // 浮游微粒
+  for (const p of plankton){
+    ctx.fillStyle = 'rgba(140,190,230,' + p.a + ')';
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+  }
+  if (state !== 'menu') drawCave();
+  else {
+    // 菜单背景：静态洞穴示意
+    ctx.fillStyle = '#0a1526';
+    ctx.beginPath(); ctx.moveTo(0, 0);
+    for (let x = 0; x <= W; x += 16) ctx.lineTo(x, 210 + Math.sin(x * 0.01 + (scrollX || 0) * 0.01) * 30);
+    ctx.lineTo(W, 0); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(0, H);
+    for (let x = 0; x <= W; x += 16) ctx.lineTo(x, H - 210 + Math.sin(x * 0.013 + 2) * 30);
+    ctx.lineTo(W, H); ctx.fill();
+  }
+  // 珍珠（自发光，黑暗中也可见 → 引诱玩家）；绿色的是护体珠
+  for (const p of pearls){
+    const x = sx(p.wx), y = p.y + Math.sin(p.bob) * 4;
+    const col = p.g ? '134,239,172' : '255,209,102', gr = p.g ? 16 : 14;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, gr);
+    g.addColorStop(0, 'rgba(' + col + ',' + (p.g ? 0.95 : 0.9) + ')'); g.addColorStop(1, 'rgba(' + col + ',0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, gr, 0, TAU); ctx.fill();
+    ctx.fillStyle = p.g ? '#eafff3' : '#fff3d6'; ctx.beginPath(); ctx.arc(x, y, p.r - 2, 0, TAU); ctx.fill();
+  }
+  for (const j of jellies) drawJelly(j);
+  // 粒子
+  for (const p of parts){
+    ctx.globalAlpha = clamp(p.age * 2, 0, 1);
+    ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // 玩家（尾迹 + 本体）
+  if (state === 'play' || state === 'dying' || state === 'menu'){
+    for (let i = 0; i < trail.length; i++){
+      const tr = trail[i];
+      ctx.fillStyle = 'rgba(103,232,249,' + (tr.a * 0.25 * i / trail.length) + ')';
+      ctx.beginPath(); ctx.arc(tr.x - (trail.length - i) * 4, tr.y, player.r * 0.7 * i / trail.length, 0, TAU); ctx.fill();
+    }
+    const py = state === 'menu' ? H * 0.5 + Math.sin(Date.now() * 0.002) * 14 : player.y;
+    const g = ctx.createRadialGradient(PX, py, 2, PX, py, 110);
+    g.addColorStop(0, 'rgba(103,232,249,0.42)'); g.addColorStop(0.35, 'rgba(103,232,249,0.18)');
+    g.addColorStop(0.7, 'rgba(103,232,249,0.06)'); g.addColorStop(1, 'rgba(103,232,249,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(PX, py, 110, 0, TAU); ctx.fill();
+    if (graceT > 0) ctx.globalAlpha = 0.45 + Math.sin(Date.now() * 0.025) * 0.3;   // 无敌闪烁
+    ctx.fillStyle = 'rgba(234,252,255,0.72)';                  // 主体白核降亮:不再晃眼,位置依然清晰
+    ctx.beginPath(); ctx.arc(PX, py, player.r, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#67e8f9';
+    ctx.beginPath(); ctx.arc(PX - 3, py - 2, 3.5, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+    // 护体绿珠：跟在身后的小尾巴
+    for (const l of lives){
+      const lg = ctx.createRadialGradient(l.x, l.y, 0, l.x, l.y, 13);
+      lg.addColorStop(0, 'rgba(134,239,172,0.85)'); lg.addColorStop(1, 'rgba(134,239,172,0)');
+      ctx.fillStyle = lg; ctx.beginPath(); ctx.arc(l.x, l.y, 13, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#d9ffe8'; ctx.beginPath(); ctx.arc(l.x, l.y, 5, 0, TAU); ctx.fill();
+    }
+  }
+  // ---- 黑暗遮罩：声呐照亮（双层：遮罩层挖孔 → 盖回主画布） ----
+  if (state === 'play' || state === 'dying'){
+    mctx.setTransform(1, 0, 0, 1, 0, 0);
+    mctx.clearRect(0, 0, maskCv.width, maskCv.height);
+    mctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+    mctx.globalCompositeOperation = 'source-over';
+    // 渐入：开局 2.5s 从 65% 可见平滑到纯黑（给新手反应时间）；死亡瞬间大幅揭开现场。
+    // 遮罩全不透明：光照不到的世界完全不可见——玩家自己也和深渊融为一体
+    const darkA = state === 'dying' ? 0.30 : Math.min(1, 0.35 + tPlay / 2.5);
+    mctx.fillStyle = 'rgba(1,4,10,' + darkA + ')';
+    mctx.fillRect(-20, -20, W + 40, H + 40);
+    mctx.globalCompositeOperation = 'destination-out';
+    const py = player.y;
+    if (state === 'dying') punch(PX, py, 470, 0.95);            // 死亡瞬间照亮"凶手"
+    else for (const p of pings){                                 // 声呐余晖：点按后短暂照见自己，随环扩散而熄灭
+      const a2 = clamp(1 - p.r / 500, 0, 1);
+      if (a2 > 0) punch(PX, py, 150 * a2, Math.min(1, 1.3 * a2));
+    }
+    for (const p of pings){                                      // 水波式照亮：软边渐变环带扫过之处，世界透出 78%
+      const pa = clamp(p.a, 0, 1);
+      const g = mctx.createRadialGradient(PX, py, Math.max(0, p.r - 80), PX, py, p.r + 80);
+      g.addColorStop(0, 'rgba(255,255,255,0)');
+      g.addColorStop(0.5, 'rgba(255,255,255,' + pa * 0.78 + ')');
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      mctx.strokeStyle = g; mctx.lineWidth = 160;
+      mctx.beginPath(); mctx.arc(PX, py, p.r, 0, TAU); mctx.stroke();
+    }
+    for (const p of pearls) punch(sx(p.wx), p.y, 22, 0.8);      // 珍珠微光
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(maskCv, 0, 0);
+    ctx.restore();
+    // 光波本体：从触点荡开的填充式渐变光,亮度沿半径单调递减、随扩散整体变暗
+    //（不做环形波峰——任何亮环都会被读成"白条",光在水里扩散本就没有环线）
+    for (const p of pings){
+      const a = clamp(p.a, 0, 1);
+      const R = p.r + 90;
+      const g = ctx.createRadialGradient(PX, py, 0, PX, py, R);
+      g.addColorStop(0, 'rgba(210,240,255,' + a * 0.16 + ')');
+      g.addColorStop(0.55, 'rgba(210,240,255,' + a * 0.10 + ')');
+      g.addColorStop(1, 'rgba(210,240,255,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(PX, py, R, 0, TAU); ctx.fill();
+    }
+  }
+  // 浮动加分文本
+  ctx.textAlign = 'left';
+  for (const f of floats){
+    ctx.globalAlpha = clamp(f.age, 0, 1);
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 17px system-ui,sans-serif';
+    ctx.fillText(f.txt, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  drawHUD();
+}
+
+function punch(x, y, r, a){
+  const g = mctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, 'rgba(255,255,255,' + a + ')');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  mctx.fillStyle = g;
+  mctx.beginPath(); mctx.arc(x, y, r, 0, TAU); mctx.fill();
+}
+
+function drawHUD(){
+  ctx.textAlign = 'center';
+  if (state === 'play' || state === 'dying'){
+    ctx.fillStyle = 'rgba(230,244,255,0.92)';
+    ctx.font = 'bold 44px system-ui,sans-serif';
+    ctx.fillText(Math.floor(score), W / 2, 74);
+    ctx.font = '13px system-ui,sans-serif';
+    ctx.fillStyle = 'rgba(148,180,210,0.7)';
+    ctx.fillText('最高 ' + best, W / 2, 96);
+    // 护体珠存量（左上角小绿点，黑暗中也可见）
+    for (let i = 0; i < Math.min(lives.length, 6); i++){
+      const gx = 26 + i * 16;
+      const gg = ctx.createRadialGradient(gx, 64, 0, gx, 64, 8);
+      gg.addColorStop(0, 'rgba(134,239,172,0.9)'); gg.addColorStop(1, 'rgba(134,239,172,0)');
+      ctx.fillStyle = gg; ctx.beginPath(); ctx.arc(gx, 64, 8, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#d9ffe8'; ctx.beginPath(); ctx.arc(gx, 64, 3, 0, TAU); ctx.fill();
+    }
+    if (combo > 1 && comboT > 0){
+      ctx.save();
+      ctx.translate(W / 2, 128); ctx.scale(comboPop, comboPop);
+      ctx.fillStyle = '#ffd166'; ctx.font = 'bold 22px system-ui,sans-serif';
+      ctx.fillText('连击 ×' + Math.min(combo, 8), 0, 0);
+      ctx.restore();
+      ctx.fillStyle = 'rgba(255,209,102,0.6)';
+      ctx.fillRect(W / 2 - 40, 138, 80 * (comboT / 2.5), 3);
+    }
+    // 新手引导:还没形成"点按=上浮+照亮"肌肉记忆前,持续提示
+    if (tutPings < 3 && tPlay < 10){
+      const pulse = 0.65 + Math.sin(Date.now() * 0.004) * 0.3;
+      ctx.fillStyle = 'rgba(234,252,255,' + pulse + ')';
+      ctx.font = 'bold 20px system-ui,sans-serif';
+      ctx.fillText('👆 点按屏幕 = 声呐脉冲', W / 2, H - 96);
+      ctx.fillStyle = 'rgba(180,212,240,0.95)'; ctx.font = '15px system-ui,sans-serif';
+      ctx.fillText('点按上浮 · 照亮四周和自己的位置 · 别沉底', W / 2, H - 71);
+    }
+  }
+  // 静音按钮
+  ctx.font = '20px system-ui,sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(muted ? '🔇' : '🔊', W - 30, 38);
+
+  if (state === 'menu'){
+    const t = Date.now() * 0.001;
+    ctx.fillStyle = '#eafcff'; ctx.font = 'bold 54px system-ui,sans-serif';
+    ctx.fillText('回声深渊', W / 2, H * 0.3);
+    ctx.fillStyle = '#67e8f9'; ctx.font = '600 15px system-ui,sans-serif';
+    ctx.fillText('E C H O   A B Y S S', W / 2, H * 0.3 + 30);
+    // 演示光波：中心渐亮的柔光荡开（与游戏内一致，无环线）
+    const rr = (t % 1.6) / 1.6, RD = 60 + rr * 240;
+    const dg = ctx.createRadialGradient(W / 2, H * 0.52, 0, W / 2, H * 0.52, RD);
+    dg.addColorStop(0, 'rgba(103,232,249,' + (1 - rr) * 0.30 + ')');
+    dg.addColorStop(0.5, 'rgba(103,232,249,' + (1 - rr) * 0.14 + ')');
+    dg.addColorStop(1, 'rgba(103,232,249,0)');
+    ctx.fillStyle = dg;
+    ctx.beginPath(); ctx.arc(W / 2, H * 0.52, RD, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(207,231,246,0.92)'; ctx.font = '17px system-ui,sans-serif';
+    ctx.fillText('点按 = 声呐脉冲：上浮 + 照亮四周', W / 2, H * 0.68);
+    ctx.fillStyle = 'rgba(148,180,210,0.85)'; ctx.font = '14px system-ui,sans-serif';
+    ctx.fillText('收集珍珠拉连击 · 躲开岩壁与水母', W / 2, H * 0.68 + 26);
+    if (best > 0){
+      ctx.fillStyle = '#ffd166'; ctx.font = 'bold 16px system-ui,sans-serif';
+      ctx.fillText('最高分 ' + best, W / 2, H * 0.68 + 60);
+    }
+    ctx.fillStyle = 'rgba(234,252,255,' + (0.5 + Math.sin(t * 3) * 0.35) + ')';
+    ctx.font = 'bold 18px system-ui,sans-serif';
+    ctx.fillText('— 点按屏幕 开始下潜 —', W / 2, H * 0.84);
+  }
+
+  if (state === 'dead'){
+    ctx.fillStyle = 'rgba(2,8,16,0.78)';
+    roundRect(W * 0.08, H * 0.28, W * 0.84, H * 0.42, 18); ctx.fill();
+    ctx.strokeStyle = 'rgba(103,232,249,0.35)'; ctx.lineWidth = 1.5;
+    roundRect(W * 0.08, H * 0.28, W * 0.84, H * 0.42, 18); ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#9fc2dd'; ctx.font = '17px system-ui,sans-serif';
+    ctx.fillText('深渊吞没了你', W / 2, H * 0.28 + 42);
+    ctx.fillStyle = '#eafcff'; ctx.font = 'bold 58px system-ui,sans-serif';
+    ctx.fillText(Math.floor(score), W / 2, H * 0.28 + 108);
+    ctx.font = '14px system-ui,sans-serif';
+    if (player.newBest){
+      ctx.fillStyle = '#ffd166'; ctx.font = 'bold 17px system-ui,sans-serif';
+      ctx.fillText('★ 新纪录！', W / 2, H * 0.28 + 136);
+    } else {
+      ctx.fillStyle = 'rgba(148,180,210,0.85)';
+      ctx.fillText('最高 ' + best, W / 2, H * 0.28 + 136);
+    }
+    ctx.fillStyle = 'rgba(207,231,246,0.9)'; ctx.font = '15px system-ui,sans-serif';
+    ctx.fillText('珍珠 ' + pearlGot + ' 颗 · 下潜 ' + Math.floor(scrollX / 40) + ' 米', W / 2, H * 0.28 + 168);
+    const t = Date.now() * 0.001;
+    ctx.fillStyle = 'rgba(234,252,255,' + (0.5 + Math.sin(t * 3) * 0.35) + ')';
+    ctx.font = 'bold 19px system-ui,sans-serif';
+    ctx.fillText('点按任意处 · 再来一局', W / 2, H * 0.28 + 216);
+    ctx.strokeStyle = 'rgba(255,209,102,0.55)'; ctx.lineWidth = 1.2;
+    roundRect(W / 2 - 88, H * 0.28 + 236, 176, 34, 17); ctx.stroke();
+    ctx.fillStyle = '#ffd166'; ctx.font = '15px system-ui,sans-serif';
+    ctx.fillText('📋 复制战绩去炫耀', W / 2, H * 0.28 + 258);
+  }
+}
+
+function roundRect(x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* ---------- 主循环 ---------- */
+let lastT = performance.now();
+function loop(now){
+  if (window.__raf !== undefined) window.__raf++;
+  let dt = Math.min((now - lastT) / 1000, 0.033);
+  lastT = now;
+  if (state === 'dying') dt *= 0.3;                            // 死亡慢动作
+  update(dt);
+  draw();
+}
+resetGame(); state = 'menu';
+const AUTOTEST = location.search.indexOf('autotest') >= 0;
+
+/* 自测钩子：?autotest 自动开始并脉冲，供无头截图/冒烟测试（setInterval 驱动以兼容虚拟时钟） */
+if (AUTOTEST){
+  window.__raf = 0;
+  setTimeout(() => { AU.init(); act(); }, 400);
+  // 模拟普通玩家：世界快全黑、或快沉底时才脉冲（省着看 = 管理高度）
+  window.__restarts = 0;
+  setInterval(() => {
+    if (state === 'dead' && performance.now() - deathAt > 600){ act(); window.__restarts++; return; }
+    if (state !== 'play') return;
+    // 见前方珍珠就追（验证拾取/连击/磁吸路径）
+    let tgt = null;
+    for (const p of pearls){
+      const dxp = (p.wx - scrollX) - PX;
+      if (dxp > -10 && dxp < 190 && (!tgt || Math.abs(p.y - player.y) < Math.abs(tgt.y - player.y))) tgt = p;
+    }
+    if (tgt && player.y - tgt.y > 40 && player.vy > -50) act();   // 珍珠在上方 → 脉冲上浮
+    const last = pings.length ? pings[pings.length - 1] : null;
+    const needLight = !last || last.r > 780;                 // 世界几乎全黑
+    const needLift  = player.y > 430 && player.vy > 200;     // 快沉底
+    if (needLight || needLift) act();
+  }, 60);
+  setInterval(() => {
+    document.title = 'st=' + state + ' sc=' + Math.floor(score) + ' t=' + Math.floor(tPlay) +
+      ' pg=' + pearlGot + ' cb=' + combo + ' jn=' + jellies.length +
+      ' lv=' + lives.length + ' sv=' + (window.__saves || 0) +
+      ' rs=' + window.__restarts + ' death=' + (window.__death || '-');
+  }, 700);
+  setInterval(() => loop(performance.now()), 16);
+} else {
+  (function raf(t){ loop(t); requestAnimationFrame(raf); })(performance.now());
+}
+
+
+</script>
+</body>
+</html>
