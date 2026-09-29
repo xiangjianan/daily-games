@@ -8,6 +8,7 @@ English switch: [English](README.md)
 
 | # | Date | 在线试玩 | Idea | 源码 |
 | --- | --- | --- | --- | --- |
+| #21 | 2026-09-29 | [Paint Rush（涂色冲刺）](paint-rush-20260929/) | 手指滚筒限时刷墙达标，黑刷抢地红漆扣时 | [source](paint-rush-20260929) |
 | #20 | 2026-09-28 | [Fuse Farm（连锁瓜田）](fuse-farm-20260928/) | 点瓜引爆连锁聚团的瓜田保卫 | [source](fuse-farm-20260928) |
 | #19 | 2026-09-27 | [Lightkeep（守灯人）](lightkeep-20260927/) | 极坐标拖转灯塔光束救船避怪 | [source](lightkeep-20260927) |
 | #18 | 2026-09-26 | [Twinoar（双桨）](twinoar-20260926/) | 双指各划一桨的双桨转向 | [source](twinoar-20260926) |
