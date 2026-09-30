@@ -8,6 +8,7 @@ One original addictive HTML5 mini-game demo per day — single-file, zero-depend
 
 | # | Date | Demo | Idea | Source |
 | --- | --- | --- | --- | --- |
+| #22 | 2026-09-30 | [Cutline](cutline-20260930/) | 点缆割断让吊货荡进移动船心的弹道预判 | [source](cutline-20260930) |
 | #21 | 2026-09-29 | [Paint Rush](paint-rush-20260929/) | 手指滚筒限时刷墙达标，黑刷抢地红漆扣时 | [source](paint-rush-20260929) |
 | #20 | 2026-09-28 | [Fuse Farm](fuse-farm-20260928/) | 点瓜引爆连锁聚团的瓜田保卫 | [source](fuse-farm-20260928) |
 | #19 | 2026-09-27 | [Lightkeep](lightkeep-20260927/) | 极坐标拖转灯塔光束救船避怪 | [source](lightkeep-20260927) |
