@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>星轨跳站 Orbita</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%237dd3fc'/></svg>">
+<style>
+html,body{margin:0;padding:0;height:100%;background:#05070f;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+#c{display:block;margin:0 auto;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* ==== 星轨跳站 Orbita — issue #23 ==== */
+const cv=document.getElementById('c'),g=cv.getContext('2d');
+let W=480,H=800,DPR=1;
+function fit(){DPR=Math.min(2,window.devicePixelRatio||1);W=Math.min(560,window.innerWidth);H=window.innerHeight;cv.width=W*DPR;cv.height=H*DPR;cv.style.width=W+'px';cv.style.height=H+'px';g.setTransform(DPR,0,0,DPR,0,0);}
+fit();addEventListener('resize',fit);
+
+const ORB_R=72;          // 公转半径
+const FLY_V=340;         // 甩出速度 px/s
+const GRAV_NONE=0;
+let S=null;              // 状态（getter 导出）
+let best=+(localStorage.getItem('orbita_best')||0);
+
+function rnd(a,b){return a+Math.random()*(b-a);}
+function newPlanet(x,y,t){ // t=游戏时间（难度依据）
+  const spike=t>40&&Math.random()<0.30;               // 40s 起红刺星
+  const cap=spike?rnd(58,72):Math.max(70,110-t*0.7);  // 捕获圈收窄
+  const body=spike?rnd(30,38):rnd(24,34);
+  const hue=spike?[348,80,58]:[rnd(190,230),70,62];
+  return {x,y,cap,body,spike,rot:rnd(0,6.28),debris:(t>55&&Math.random()<0.4),hue,seed:Math.random()};
+}
+function reset(){
+  S={mode:'menu',t:0,score:0,combo:0,lastHop:-9,camx:0,shake:0,overAt:0,hops:0,deathCause:null,
+     ship:{x:0,y:0,vx:0,vy:0,planet:null,ang:0,dir:1,trail:[],orbT:0,warned:false,exempt:null},
+     planets:[],parts:[],pops:[],deaths:0,nextX:0,flashes:0};
+  // 起始行星+预铺 3 颗
+  const p0=newPlanet(140,H*0.55,0);p0.cap=130;p0.body=28;
+  S.planets.push(p0);
+  S.nextX=p0.x+rnd(300,380);
+  while(S.nextX<S.camx+W+400){S.planets.push(newPlanet(S.nextX,rnd(H*0.22,H*0.72),S.t));S.nextX+=rnd(300,380);}
+  S.ship.planet=p0;S.ship.ang=Math.PI;S.ship.dir=1;
+  window.__ORB=S;
+}
+Object.defineProperty(window,'ORBITA',{get:()=>S,configurable:true});
+
+function die(cause){
+  if(S.mode!=='play')return;
+  S.mode='over';S.overAt=performance.now();S.shake=14;S.deaths++;
+  S.deathCause=cause;
+  for(let i=0;i<26;i++){const a=rnd(0,6.28),v=rnd(40,240);S.parts.push({x:S.ship.x,y:S.ship.y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,l:rnd(.3,.8),c:'#f87171'});}
+  if(S.score>best){best=S.score;localStorage.setItem('orbita_best',best);}
+  sfxDie();
+}
+function hop(){ // 脱离轨道，切线甩出
+  const sh=S.ship,p=sh.planet;if(!p)return;
+  const tx=-Math.sin(sh.ang)*sh.dir,ty=Math.cos(sh.ang)*sh.dir;
+  sh.vx=tx*FLY_V;sh.vy=ty*FLY_V;sh.planet=null;sh.exempt=p;
+  sfxWhoosh();
+}
+function update(dt){
+  if(S.mode!=='play')return;
+  S.t+=dt;
+  const sh=S.ship;
+  if(sh.planet){ // 公转
+    sh.ang+=2.05*sh.dir*dt;
+    sh.x=sh.planet.x+Math.cos(sh.ang)*ORB_R;
+    sh.y=sh.planet.y+Math.sin(sh.ang)*ORB_R;
+    sh.trail.push({x:sh.x,y:sh.y,l:.5});
+    sh.orbT=(sh.orbT||0)+dt; // 滞留过载
+    if(sh.orbT>2.6&&!sh.warned){sh.warned=true;sfxWarn();}
+    if(sh.orbT>4){ // 行星塌缩爆炸
+      const p=sh.planet;
+      for(let i=0;i<30;i++){const a=rnd(0,6.28),v=rnd(60,300);S.parts.push({x:p.x+Math.cos(a)*p.body,y:p.y+Math.sin(a)*p.body,vx:Math.cos(a)*v,vy:Math.sin(a)*v,l:rnd(.4,.9),c:p.spike?'#fb7185':'#fbbf24'});}
+      p.gone=true;die('collapse');return;
+    }
+  }else{ // 直线飞行
+    sh.x+=sh.vx*dt;sh.y+=sh.vy*dt;
+    sh.trail.push({x:sh.x,y:sh.y,l:.35});
+  }
+  if(sh.trail.length>40)sh.trail.shift();
+  for(const tr of sh.trail)tr.l-=dt;
+  // 捕获判定
+  for(const p of S.planets){
+    if(p===sh.planet)continue;
+    const dx=sh.x-p.x,dy=sh.y-p.y,d=Math.hypot(dx,dy);
+    if(p===sh.exempt){if(d>p.cap+26)sh.exempt=null;continue;} // 刚甩出的行星直到飞出圈外才可再捕获
+    if(d<p.cap&&sh.planet!==p){ // 被捕获
+      sh.planet=p;sh.exempt=null;sh.ang=Math.atan2(dy,dx);
+      sh.orbT=0;sh.warned=false;
+      sh.dir=(sh.vx*(dy)-sh.vy*(dx))>0?1:-1; // 速度×径向叉积定公转方向
+      sh.vx=sh.vy=0;
+      S.combo=(S.t-S.lastHop<2.5)?Math.min(5,S.combo+1):1;
+      S.lastHop=S.t;S.score+=10*S.combo;S.hops=(S.hops||0)+1;
+      S.pops.push({x:sh.x,y:sh.y-20,txt:'+'+(10*S.combo),l:.9,c:S.combo>=3?'#fbbf24':'#7dd3fc'});
+      if(S.combo>=2)sfxHop(S.combo);else sfxHop(1);
+      for(let i=0;i<10;i++){const a=rnd(0,6.28),v=rnd(30,130);S.parts.push({x:sh.x,y:sh.y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,l:rnd(.2,.5),c:'#a5f3fc'});}
+      break;
+    }
+  }
+  // 死亡判定
+  if(!sh.planet){
+    if(sh.x<S.camx-80||sh.x>S.camx+W+80||sh.y<-80||sh.y>H+80)die('offscreen');
+    else for(const p of S.planets){if(Math.hypot(sh.x-p.x,sh.y-p.y)<p.body+8){die('crash');break;}}
+  }
+  // 生成前方行星
+  while(S.nextX<S.camx+W+500){S.planets.push(newPlanet(S.nextX,rnd(H*0.22,H*0.72),S.t));S.nextX+=Math.min(560,300+S.t*3)+rnd(-40,60);}
+  // 清理身后
+  S.planets=S.planets.filter(p=>(!p.gone&&p.x>S.camx-300)||p===sh.planet);
+  // 相机跟随
+  S.camx+=(Math.max(0,sh.x-W*0.38)-S.camx)*Math.min(1,dt*3);
+  // 粒子/飘字/震屏
+  S.parts=S.parts.filter(q=>{q.x+=q.vx*dt;q.y+=q.vy*dt;q.l-=dt;return q.l>0;});
+  S.pops=S.pops.filter(q=>{q.y-=40*dt;q.l-=dt;return q.l>0;});
+  S.shake=Math.max(0,S.shake-dt*30);
+}
+function render(){
+  g.clearRect(0,0,W,H);
+  // 背景渐变+视差星
+  const bg=g.createLinearGradient(0,0,0,H);bg.addColorStop(0,'#070b18');bg.addColorStop(1,'#0b1024');
+  g.fillStyle=bg;g.fillRect(0,0,W,H);
+  if(!S.stars){S.stars=[];for(let i=0;i<70;i++)S.stars.push({x:Math.random()*W,y:Math.random()*H,s:Math.random()*1.5+0.4,tw:Math.random()*6});}
+  const now=performance.now()/1000;
+  g.fillStyle='#94a3b8';
+  for(const st of S.stars){const sx=((st.x-S.camx*0.35)%W+W)%W;g.globalAlpha=0.25+0.35*Math.abs(Math.sin(now+st.tw));g.fillRect(sx,st.y,st.s,st.s);}
+  g.globalAlpha=1;
+  const sh=S.ship,ox=(Math.random()-0.5)*S.shake,oy=(Math.random()-0.5)*S.shake;
+  g.save();g.translate(-S.camx+ox,oy);
+  // 行星
+  for(const p of S.planets){
+    const sx=p.x,sy=p.y;
+    if(p.gone||sx<S.camx-200||sx>S.camx+W+200)continue;
+    const col=p.spike?'hsl(348,80%,58%)':'hsl('+p.hue[0]+','+p.hue[1]+'%,'+p.hue[2]+'%)';
+    const ring=(p===sh.planet&&sh.orbT>2.6)?(sh.orbT>3.4?'#f87171':'#fbbf24'):col; // 滞留警报
+    const br=p.body*(p===sh.planet&&sh.orbT>3.4?1+0.08*Math.sin(now*28):1); // 临爆脉冲
+    // 捕获圈（虚线）
+    g.save();g.strokeStyle=ring;g.globalAlpha=p===sh.planet?0.85:0.35;g.lineWidth=p===sh.planet?2.5:1.5;g.setLineDash([7,9]);
+    if(p===sh.planet){g.lineWidth=2.5;g.setLineDash([]);g.globalAlpha=0.22;g.beginPath();g.arc(sx,sy,p.cap,0,6.29);g.fillStyle=ring;g.fill();}
+    g.beginPath();g.arc(sx,sy,p.cap,0,6.29);g.stroke();g.restore();
+    // 本体
+    g.save();g.fillStyle=col;g.beginPath();g.arc(sx,sy,br,0,6.29);g.fill();
+    g.globalAlpha=0.3;g.fillStyle='#fff';g.beginPath();g.arc(sx-br*0.3,sy-br*0.3,br*0.4,0,6.29);g.fill();g.restore();
+    if(p.spike){ // 刺
+      g.save();g.strokeStyle=col;g.lineWidth=2;
+      for(let i=0;i<8;i++){const a=p.rot+i*Math.PI/4;g.beginPath();g.moveTo(sx+Math.cos(a)*(p.body+3),sy+Math.sin(a)*(p.body+3));g.lineTo(sx+Math.cos(a)*(p.body+11),sy+Math.sin(a)*(p.body+11));g.stroke();}
+      g.restore();
+    }
+    if(p.debris){ // 碎石带
+      g.save();g.fillStyle='#64748b';
+      for(let i=0;i<6;i++){const a=p.rot*0.7+i*1.047;g.beginPath();g.arc(sx+Math.cos(a)*(p.cap+16),sy+Math.sin(a)*(p.cap+16),3.5,0,6.29);g.fill();}
+      g.restore();
+    }
+    p.rot+=0.008;
+  }
+  // 切线预瞄（公转中）
+  if(sh.planet&&S.mode==='play'){
+    const tx=-Math.sin(sh.ang)*sh.dir,ty=Math.cos(sh.ang)*sh.dir;
+    g.save();g.strokeStyle='#fbbf24';g.globalAlpha=0.6;g.setLineDash([4,7]);g.lineWidth=2;
+    g.beginPath();g.moveTo(sh.x+tx*16,sh.y+ty*16);g.lineTo(sh.x+tx*260,sh.y+ty*260);g.stroke();g.restore();
+  }
+  // 尾迹
+  for(const tr of sh.trail){if(tr.l<=0)continue;g.globalAlpha=tr.l*0.8;g.fillStyle='#7dd3fc';g.beginPath();g.arc(tr.x,tr.y,3.2*tr.l+1,0,6.29);g.fill();}
+  g.globalAlpha=1;
+  // 飞船
+  if(S.mode!=='over'){
+    let a;
+    if(sh.planet)a=Math.atan2(Math.cos(sh.ang)*sh.dir,-Math.sin(sh.ang)*sh.dir);
+    else a=Math.atan2(sh.vy,sh.vx);
+    g.save();g.translate(sh.x,sh.y);g.rotate(a);g.fillStyle='#e0f2fe';
+    g.beginPath();g.moveTo(13,0);g.lineTo(-9,7);g.lineTo(-5,0);g.lineTo(-9,-7);g.closePath();g.fill();g.restore();
+  }
+  // 粒子/飘字
+  for(const q of S.parts){g.globalAlpha=Math.max(0,q.l*1.6);g.fillStyle=q.c;g.fillRect(q.x-2,q.y-2,4,4);}
+  g.globalAlpha=1;
+  for(const q of S.pops){g.globalAlpha=Math.min(1,q.l*1.5);g.fillStyle=q.c;g.font='bold 20px system-ui';g.textAlign='center';g.fillText(q.txt,q.x,q.y);}
+  g.globalAlpha=1;g.restore();
+  // HUD
+  if(S.mode==='play'||S.mode==='over'){
+    g.fillStyle='#e2e8f0';g.font='bold 34px system-ui';g.textAlign='center';g.fillText(S.score,W/2,64);
+    if(S.combo>=2){g.fillStyle='#fbbf24';g.font='bold 19px system-ui';g.fillText('COMBO ×'+S.combo,W/2,92);}
+    g.fillStyle='#64748b';g.font='13px system-ui';g.textAlign='right';g.fillText('最佳 '+best,W-14,30);
+  }
+  // 菜单/结算覆盖层
+  if(S.mode==='menu'){
+    g.fillStyle='rgba(5,7,15,0.55)';g.fillRect(0,0,W,H);
+    g.textAlign='center';g.fillStyle='#7dd3fc';g.font='bold 44px system-ui';g.fillText('星轨跳站',W/2,H*0.34);
+    g.fillStyle='#94a3b8';g.font='16px system-ui';
+    g.fillText('点按 = 沿切线甩出飞船',W/2,H*0.34+52);
+    g.fillText('被下一颗行星捕获即转轨得分',W/2,H*0.34+80);
+    g.fillText('撞星体 / 飞出屏幕 = 坠毁',W/2,H*0.34+108);
+    if(Math.floor(now*2)%2===0){g.fillStyle='#fbbf24';g.font='bold 20px system-ui';g.fillText('点按起飞',W/2,H*0.34+170);}
+  }
+  if(S.mode==='over'){
+    g.fillStyle='rgba(5,7,15,0.6)';g.fillRect(0,0,W,H);
+    g.textAlign='center';g.fillStyle='#f87171';g.font='bold 38px system-ui';g.fillText('坠毁',W/2,H*0.36);
+    g.fillStyle='#e2e8f0';g.font='bold 30px system-ui';g.fillText('得分 '+S.score,W/2,H*0.36+52);
+    g.fillStyle=S.score>=best&&S.score>0?'#fbbf24':'#64748b';g.font='16px system-ui';
+    g.fillText(S.score>=best&&S.score>0?'★ 新纪录!':'最佳 '+best,W/2,H*0.36+84);
+    if(Math.floor(now*2)%2===0){g.fillStyle='#7dd3fc';g.font='bold 19px system-ui';g.fillText('点按再来一局',W/2,H*0.36+140);}
+  }
+}
+/* ==== 输入 ==== */
+let AC=null;
+function initAudio(){if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}}if(AC&&AC.state==='suspended')AC.resume();}
+function tone(f0,f1,dur,type,vol){if(!AC)return;const o=AC.createOscillator(),gn=AC.createGain(),t=AC.currentTime;
+  o.type=type;o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+dur);
+  gn.gain.setValueAtTime(vol,t);gn.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(gn);gn.connect(AC.destination);o.start(t);o.stop(t+dur);}
+function sfxHop(c){tone(300*Math.pow(1.14,c),300*Math.pow(1.14,c)*1.6,0.14,'triangle',0.16);if(c>=3)tone(600*Math.pow(1.1,c),900,0.12,'sine',0.10);}
+function sfxWhoosh(){tone(220,90,0.18,'sawtooth',0.05);}
+function sfxDie(){tone(160,38,0.5,'sawtooth',0.22);}
+function sfxWarn(){tone(880,660,0.09,'square',0.09);}
+function onTap(){
+  initAudio();
+  if(S.mode==='menu'){S.mode='play';return;}
+  if(S.mode==='over'){if(performance.now()-S.overAt>350){reset();S.mode='play';}return;}
+  hop();
+}
+cv.addEventListener('pointerdown',e=>{e.preventDefault();onTap();},{passive:false});
+document.addEventListener('keydown',e=>{if(e.code==='Space'||e.code==='ArrowUp'){e.preventDefault();onTap();}});
+/* ==== autotest + boot ==== */
+const AUT=location.search.indexOf('autotest')>=0;
+function wrapA(d){while(d>Math.PI)d-=2*Math.PI;while(d<-Math.PI)d+=2*Math.PI;return d;}
+function botTick(){ // 切线对准下一颗行星即甩出
+  if(S.mode==='menu'){S.mode='play';return;}
+  if(S.mode==='over'){if(performance.now()-S.overAt>420){reset();S.mode='play';}return;}
+  const sh=S.ship;
+  if(S.mode==='play'&&sh.planet){
+    let tp=null;
+    for(const p of S.planets){if(p===sh.planet||p===sh.exempt)continue;if(p.x>sh.planet.x+40&&(!tp||p.x<tp.x))tp=p;}
+    if(tp){
+      const angTo=Math.atan2(tp.y-sh.y,tp.x-sh.x),tan=sh.ang+sh.dir*Math.PI/2;
+      if(Math.abs(wrapA(angTo-tan))<0.12)hop();
+    }
+  }
+}
+let last=0;
+function loop(t){
+  try{
+    const dt=Math.min(0.033,(t-(loop.last||t))/1000);loop.last=t;
+    update(dt);render();
+  }catch(e){window.__err=e&&e.stack;}
+  if(!AUT)requestAnimationFrame(loop);
+}
+reset();
+if(AUT){
+  setInterval(()=>{try{botTick();}catch(e){window.__botErr=e&&e.stack;}},16);
+  setInterval(()=>{try{document.title='st='+S.mode+' sc='+S.score+' hp='+S.hops+' t='+S.t.toFixed(1)+' cause='+(S.deathCause||'-')+(window.__err?' ERR':'');}catch(e){}},200);
+  setInterval(()=>loop(performance.now()),16);
+}else{
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
