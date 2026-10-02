@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>不倒天平 TIPSCALE</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23141a24'/><rect x='4' y='15' width='24' height='3' rx='1.5' fill='%235ee6c8'/></svg>">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{width:100%;height:100%;overflow:hidden;background:#0b0f16;font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;touch-action:none;user-select:none;-webkit-user-select:none}
+#cv{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+'use strict';
+// ==== TIPSCALE #24: 投放配平力矩 ====
+const cv=document.getElementById('cv'),cx=cv.getContext('2d');
+let W=0,H=0,DPR=1;
+function fit(){DPR=Math.min(2,window.devicePixelRatio||1);W=window.innerWidth;H=window.innerHeight;cv.width=W*DPR;cv.height=H*DPR;cx.setTransform(DPR,0,0,DPR,0,0);}
+window.addEventListener('resize',fit);fit();
+
+const FLOOR=()=>H-86;                 // 支点基座顶部
+const PIVY=()=>FLOOR()-46;            // 秤杆枢轴 y
+const HALF=()=>Math.min(215,W*0.42);  // 秤杆半长
+const MAXTILT=30*Math.PI/180;         // 折断倾角
+const SLIDTILT=16*Math.PI/180;        // 开始打滑倾角
+
+let S=null;
+const HS_KEY='tipscale_hs_v1';
+function best(){return +(localStorage.getItem(HS_KEY)||0)}
+
+function reset(){
+  S={mode:'menu',t:0,score:0,tilt:0,angV:0,
+     blocks:[],queue:[],parts:[],shake:0,
+     overAt:0,deaths:0,combo:0,comboT:0,
+     wind:0,windT:0,tiltOver:0,placed:0,
+     lastSide:0,dropFade:[]};
+  refillQueue();
+}
+function mkBlock(){
+  const t=S.t;
+  const hard=Math.min(1,t/95);                 // 95s 到满难度
+  const wMax=1.6+2.6*hard;                    // 重量上限 1.6→4.2
+  const w=+(0.8+Math.random()*wMax).toFixed(2);
+  const gold=Math.random()<0.07+0.05*hard;    // 金块概率升
+  const bw=(gold?26:34)+Math.random()*(26+18*hard); // 宽 34→78
+  return {w:gold?w*1.9:w, bw, gold, id:Math.random()*1e6|0};
+}
+function refillQueue(){ while(S.queue.length<3) S.queue.push(mkBlock()); }
+
+// ==== chunk B: 物理与投放 ====
+function drop(px){
+  if(S.mode==='menu'){startGame();return;}
+  if(S.mode==='over'){ if(performance.now()-S.overAt>500) reset(); return; }
+  if(!S.queue.length) return;
+  const half=HALF(),b=S.queue.shift();
+  const lx=Math.max(-half+b.bw/2,Math.min(half-b.bw/2,(px-W/2)));
+  const b2={...b,lx,y:-60-b.bw,vy:0,landed:false,h:Math.max(14,Math.min(30,b.bw*0.42)),stackH:0};
+  S.falling=b2; refillQueue(); sfx('throw');
+}
+function landBlock(f){
+  // 计算支撑高度
+  const py=PIVY(),st=Math.sin(S.tilt);
+  let support=py - st*f.lx - 7; // 杆面
+  for(const b of S.blocks){
+    const overlap=(f.bw+b.bw)/2*0.62;
+    if(Math.abs(b.lx-f.lx)<overlap){
+      const by=py - st*b.lx - 7 - b.stackH - b.h/2;
+      const cand=by - b.h/2 - f.h/2;
+      if(cand<support) support=cand;
+    }
+  }
+  f.landed=true; f.y=support; f.lx0=f.lx;
+  // stackH: 距杆面高度
+  f.stackH=(py - st*f.lx - 7) - support;
+  S.blocks.push(f); S.placed++;
+  // 计分与连击
+  const side=f.lx>18?1:f.lx<-18?-1:0;
+  let mult=f.gold?5:1;
+  if(side!==0&&side===-S.lastSide){S.combo=Math.min(8,S.combo+1);S.comboT=2.6;}else{S.combo=side!==0?1:0;S.comboT=side!==0?2.6:0;}
+  if(side!==0)S.lastSide=side;
+  const gain=Math.round((10+S.placed*0.8)*mult*(1+0.25*Math.max(0,S.combo-1)));
+  S.score+=gain;
+  burst(W/2+f.lx*Math.cos(S.tilt),support,f.gold?18:8,f.gold?'#ffd257':'#8fb4d9');
+  S.shake=Math.min(9,2.5+f.w*1.4); sfx(f.gold?'gold':'land');
+}
+function step(dt){
+  if(!S)return;
+  if(S.mode==='play'){
+    S.t+=dt;
+    if(S.comboT>0){S.comboT-=dt;if(S.comboT<=0)S.combo=0;}
+    // 风阵（25s 后）
+    S.windT-=dt;
+    if(S.windT<=-1.15){S.windT=8+Math.random()*7;S.windDir=Math.random()<0.5?1:-1;}
+    if(S.windT<0){
+      const hard=Math.min(1,S.t/95);
+      S.wind=Math.sin(Math.min(1,-S.windT/1.15)*Math.PI)*(0.35+0.5*hard)*(S.windDir||1);
+    } else S.wind=0;
+    // 落体
+    const f=S.falling;
+    if(f){
+      f.vy+=1500*dt; f.y+=f.vy*dt;
+      const half=HALF();
+      const lx=Math.max(-half+f.bw/2,Math.min(half-f.bw/2,f.lx));
+      const target=surfaceTopFor(f,lx);
+      if(f.y>=target){f.y=target;landBlock(f);S.falling=null;}
+      else f.lx=lx;
+    }
+    // 力矩物理
+    const half=HALF();
+    let T=0;
+    for(const b of S.blocks) T+=b.w*(b.lx/half);
+    T+=S.wind*1.0;
+    const alpha=(T*0.67 - S.angV*2.4);
+    S.angV+=alpha*dt; S.tilt+=S.angV*dt;
+    // 打滑 + 回位摩擦
+    const at=Math.abs(S.tilt);
+    const g=520, mu=0.30;
+    for(const b of S.blocks){
+      if(at>SLIDTILT&&Math.abs(b.lx)>half*0.34&&Math.sign(b.lx)===Math.sign(S.tilt)){
+        const a=g*(Math.sin(at)-mu*Math.cos(at));
+        b.slide=(b.slide||0)+a*dt*Math.sign(S.tilt)*0.9;
+      } else if(b.slide){
+        b.slide-=b.slide*Math.min(1,4*dt);              // 摩擦衰减
+        if(b.lx0!==undefined)b.lx+=(b.lx0-b.lx)*Math.min(1,2.2*dt); // 回位
+      }
+      if(b.slide)b.lx+=b.slide*dt;
+    }
+    // 死亡判定：滑出杆端 / 折断
+    for(const b of S.blocks){
+      if(Math.abs(b.lx)>half+6){die('slide');break;}
+    }
+    if(S.mode==='play'){
+      if(at>MAXTILT*1.1){S.tiltOver+=dt;if(S.tiltOver>0.6)die('snap');}
+      else S.tiltOver=0;
+      if(S.blocks.length&&at>MAXTILT*1.1)S.tiltOver+=0;
+    }
+  } else if(S.mode==='over'){
+    S.tiltOver=0;
+  }
+  // 粒子与衰减
+  for(let i=S.parts.length-1;i>=0;i--){const p=S.parts[i];p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=800*dt;p.life-=dt;if(p.life<=0)S.parts.splice(i,1);}
+  if(S.shake>0)S.shake=Math.max(0,S.shake-30*dt);
+  if(S.falling&&!S.falling.landed){/* falling handled */}
+}
+function surfaceTopFor(f,lx){
+  const py=PIVY(),st=Math.sin(S.tilt);
+  let support=py - st*lx - 7 - f.h/2;
+  for(const b of S.blocks){
+    const overlap=(f.bw+b.bw)/2*0.62;
+    if(Math.abs(b.lx-lx)<overlap){
+      const cand=py - st*b.lx - 7 - b.stackH - b.h - f.h/2;
+      if(cand<support) support=cand;
+    }
+  }
+  return support;
+}
+function die(cause){
+  if(S.mode!=='play')return;
+  S.mode='over';S.overAt=performance.now();S.deaths++;S.cause=cause;
+  const hs=best(); if(S.score>hs){localStorage.setItem(HS_KEY,S.score);S.newHS=true;}else S.newHS=false;
+  S.shake=14; sfx('snap');
+  for(let i=0;i<26;i++)burst(W/2+(Math.random()-0.5)*HALF()*2,PIVY(),1,'#ff7a6b');
+  if(window.__tsCause)window.__tsCause(cause);
+}
+function startGame(){reset();S.mode='play';S.windT=12+Math.random()*5;}
+function burst(x,y,n,col){for(let i=0;i<n;i++){S.parts.push({x,y,vx:(Math.random()-0.5)*260,vy:-Math.random()*230-40,life:0.5+Math.random()*0.3,col});}}
+// ==== chunk C: 渲染 ====
+function draw(){
+  cx.clearRect(0,0,W,H);
+  // 背景
+  const bg=cx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#0b0f16');bg.addColorStop(1,'#101826');
+  cx.fillStyle=bg;cx.fillRect(0,0,W,H);
+  // 微弱网格
+  cx.strokeStyle='rgba(94,230,200,0.045)';cx.lineWidth=1;
+  for(let x=0.5;x<W;x+=44){cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,H);cx.stroke();}
+  const sx=(Math.random()-0.5)*S.shake,sy=(Math.random()-0.5)*S.shake;
+  cx.save();cx.translate(sx,sy);
+  drawScale();
+  drawQueue();
+  drawParticles();
+  cx.restore();
+  drawHUD();
+}
+function drawScale(){
+  const half=HALF(),py=PIVY(),tl=S.tilt,at=Math.abs(tl);
+  // 基座
+  cx.fillStyle='#1b2534';
+  cx.beginPath();cx.moveTo(W/2-34,FLOOR());cx.lineTo(W/2+34,FLOOR());cx.lineTo(W/2,py+16);cx.closePath();cx.fill();
+  cx.fillStyle='#232f42';cx.fillRect(W/2-52,FLOOR(),104,8);
+  // 倾角计（弧形表）
+  const mr=Math.min(120,W*0.16),mx=W-mr-26,my=64;
+  cx.lineWidth=7;cx.lineCap='round';
+  cx.strokeStyle='rgba(255,255,255,0.08)';
+  cx.beginPath();cx.arc(W/2,my,mr,Math.PI*1.25,Math.PI*1.75);cx.stroke();
+  // 需要映射：tilt -MAX..MAX → 表盘角度。中心指针
+  const frac=Math.max(-1,Math.min(1,tl/(MAXTILT*1.1)));
+  const danger=Math.abs(frac)>SLIDTILT/(MAXTILT*1.1);
+  cx.strokeStyle=danger?'#ff7a6b':'#5ee6c8';
+  cx.beginPath();cx.arc(W/2,my,mr,Math.PI*1.5,Math.PI*1.5+frac*Math.PI*0.5,frac<0);cx.stroke();
+  cx.fillStyle=danger?'#ff7a6b':'rgba(255,255,255,0.5)';
+  cx.font='11px sans-serif';cx.textAlign='center';
+  cx.fillText((tl*180/Math.PI).toFixed(0)+'°',W/2,my+4);
+  // 风警示箭头
+  if(S.mode==='play'&&S.windT<0.9&&S.windT>-1.3){
+    const wa=S.windDir||1,prog=Math.max(0,Math.min(1,(S.windT<-0?-S.windT:0)/1.15));
+    cx.fillStyle=`rgba(255,210,87,${0.35+0.5*prog})`;
+    cx.font='bold 30px sans-serif';
+    cx.save();cx.translate(W/2+wa*(half+34),py-70);cx.scale(wa,1);
+    cx.fillText('≋',0,0);cx.restore();
+  }
+  // 秤杆
+  cx.save();cx.translate(W/2,py);cx.rotate(tl);
+  const danger2=at>SLIDTILT;
+  cx.fillStyle=danger2?(at>MAXTILT*0.95?'#ff7a6b':'#ffb457'):'#5ee6c8';
+  cx.fillRect(-half,-7,half*2,14);
+  cx.fillStyle='rgba(255,255,255,0.18)';cx.fillRect(-half,-7,half*2,3);
+  // 刻度
+  cx.fillStyle='rgba(11,15,22,0.55)';
+  for(let i=-2;i<=2;i++){if(i)cx.fillRect(i*half/2.5-1,-7,2,14);}
+  cx.beginPath();cx.arc(0,0,5.5,0,7);cx.fillStyle='#0b0f16';cx.fill();
+  // 已放积木
+  for(const b of S.blocks){
+    const y=-7-b.stackH-b.h/2;
+    cx.fillStyle=b.gold?'#ffd257':(b.slide?'#e08f7f':'#8fb4d9');
+    cx.fillRect(b.lx-b.bw/2,y-b.h/2,b.bw,b.h);
+    cx.fillStyle='rgba(11,15,22,0.4)';
+    cx.fillRect(b.lx-b.bw/2,y+b.h/2-3,b.bw,3);
+    if(b.gold){cx.fillStyle='#141a24';cx.font='bold 9px sans-serif';cx.textAlign='center';cx.fillText('★',b.lx,y+3);}
+  }
+  // 下落中积木
+  const f=S.falling;
+  if(f&&!f.landed){
+    const fx=f.lx*Math.cos(tl);
+    cx.fillStyle='rgba(143,180,217,0.35)';
+    cx.fillRect(fx-f.bw/2,-9999,f.bw,9999); // 落点参考线
+    cx.fillStyle=f.gold?'#ffd257':'#c8d9ec';
+    cx.fillRect(fx-f.bw/2,f.y-f.h/2,f.bw,f.h);
+  }
+  cx.restore();
+}
+function drawQueue(){
+  if(S.mode!=='play')return;
+  cx.font='11px sans-serif';cx.textAlign='left';
+  cx.fillStyle='rgba(255,255,255,0.55)';
+  cx.fillText('NEXT',16,30);
+  for(let i=0;i<S.queue.length;i++){
+    const b=S.queue[i];
+    const x=16,y=44+i*54;
+    cx.globalAlpha=i===0?1:0.55;
+    cx.fillStyle=b.gold?'#ffd257':'#8fb4d9';
+    const h=Math.max(14,Math.min(30,b.bw*0.42));
+    cx.fillRect(x,y,b.bw*0.9,h);
+    if(b.gold){cx.fillStyle='#141a24';cx.font='bold 9px sans-serif';cx.fillText('★',x+6,y+h/2+3);}
+    else{cx.fillStyle='rgba(11,15,22,0.65)';cx.font='9px sans-serif';cx.fillText(b.w.toFixed(1),x+4,y+h/2+3);}
+    cx.globalAlpha=1;
+  }
+}
+function drawParticles(){
+  for(const p of S.parts){
+    cx.globalAlpha=Math.max(0,p.life*2);
+    cx.fillStyle=p.col;
+    cx.fillRect(p.x-2,p.y-2,4,4);
+  }
+  cx.globalAlpha=1;
+}
+function drawHUD(){
+  cx.textAlign='left';
+  cx.fillStyle='#e8f2fa';cx.font='bold 26px sans-serif';
+  cx.fillText(String(S.score),16,H-52);
+  cx.fillStyle='rgba(255,255,255,0.45)';cx.font='11px sans-serif';
+  cx.fillText('最高 '+Math.max(best(),S.score),16,H-30);
+  if(S.combo>=2){
+    cx.fillStyle='#ffd257';cx.font='bold 17px sans-serif';cx.textAlign='right';
+    cx.fillText('COMBO ×'+S.combo,W-16,H-30);
+  }
+  if(S.mode==='menu'){
+    cx.fillStyle='rgba(8,11,17,0.72)';cx.fillRect(0,0,W,H);
+    cx.textAlign='center';
+    cx.fillStyle='#5ee6c8';cx.font='bold 34px sans-serif';
+    cx.fillText('不倒天平',W/2,H*0.36);
+    cx.fillStyle='#e8f2fa';cx.font='15px sans-serif';
+    cx.fillText('点按位置投放积木，实时配平力矩',W/2,H*0.36+34);
+    cx.fillStyle='rgba(255,255,255,0.6)';cx.font='13px sans-serif';
+    cx.fillText('倾斜过 16° 积木会打滑 · 30° 秤杆折断',W/2,H*0.36+60);
+    cx.fillText('左右交替投放有 COMBO · ★ 金块 ×5 分但更沉',W/2,H*0.36+82);
+    cx.fillStyle='rgba(94,230,200,0.9)';cx.font='bold 16px sans-serif';
+    cx.fillText('点按任意处开始',W/2,H*0.36+130);
+    cx.fillStyle='rgba(255,255,255,0.35)';cx.font='12px sans-serif';
+    cx.fillText('最高分 '+best(),W/2,H*0.36+158);
+  }
+  if(S.mode==='over'){
+    cx.fillStyle='rgba(8,11,17,0.66)';cx.fillRect(0,0,W,H);
+    cx.textAlign='center';
+    cx.fillStyle='#ff7a6b';cx.font='bold 30px sans-serif';
+    cx.fillText(S.cause==='slide'?'积木滑落！':'秤杆折断！',W/2,H*0.34);
+    cx.fillStyle='#e8f2fa';cx.font='bold 44px sans-serif';
+    cx.fillText(String(S.score),W/2,H*0.34+56);
+    if(S.newHS){cx.fillStyle='#ffd257';cx.font='bold 15px sans-serif';cx.fillText('新纪录！',W/2,H*0.34+82);}
+    else{cx.fillStyle='rgba(255,255,255,0.5)';cx.font='13px sans-serif';cx.fillText('最高 '+best(),W/2,H*0.34+82);}
+    cx.fillStyle='rgba(94,230,200,0.9)';cx.font='bold 16px sans-serif';
+    cx.fillText('点按任意处再来一局',W/2,H*0.34+128);
+  }
+}
+// ==== chunk D: 音效/juice/输入 ====
+let AC=null;
+function ac(){if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}}if(AC&&AC.state==='suspended')AC.resume();return AC;}
+function tone(f0,f1,dur,type,vol,delay){
+  const a=ac();if(!a)return;
+  const t=a.currentTime+(delay||0);
+  const o=a.createOscillator(),g=a.createGain();
+  o.type=type||'sine';o.frequency.setValueAtTime(f0,t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+dur);
+  g.gain.setValueAtTime(vol||0.12,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(g);g.connect(a.destination);o.start(t);o.stop(t+dur+0.02);
+}
+function noise(dur,vol){
+  const a=ac();if(!a)return;
+  const n=a.sampleRate*dur|0,buf=a.createBuffer(1,n,a.sampleRate),d=buf.getChannelData(0);
+  for(let i=0;i<n;i++)d[i]=(Math.random()*2-1)*(1-i/n);
+  const s=a.createBufferSource();s.buffer=buf;
+  const g=a.createGain();g.gain.value=vol||0.2;
+  const f=a.createBiquadFilter();f.type='lowpass';f.frequency.value=900;
+  s.connect(f);f.connect(g);g.connect(a.destination);s.start();
+}
+function sfx(k){
+  if(k==='throw')tone(300,520,0.09,'triangle',0.07);
+  else if(k==='land'){tone(160,90,0.1,'sine',0.14);noise(0.06,0.1);}
+  else if(k==='gold'){tone(660,990,0.1,'triangle',0.1);tone(990,1320,0.12,'triangle',0.08,0.07);}
+  else if(k==='snap'){tone(220,40,0.5,'sawtooth',0.18);noise(0.3,0.28);}
+  else if(k==='combo')tone(500,760,0.07,'square',0.05);
+}
+function pt(e){const t=e.touches?e.touches[0]:e;return t.clientX;}
+function onPress(e){
+  e.preventDefault();ac();
+  if(!S)return;
+  if(S.mode==='play'){
+    if(!S.falling)drop(pt(e));
+  } else drop(pt(e)); // menu 开始 / over 重开（drop 内处理冷却）
+}
+window.addEventListener('mousedown',onPress,{passive:false});
+window.addEventListener('touchstart',onPress,{passive:false});
+window.addEventListener('touchmove',e=>e.preventDefault(),{passive:false});
+// ==== chunk E: autotest ====
+Object.defineProperty(window,'TIPSCALE',{get:()=>S,configurable:true});
+window.__tsDeath=0;window.__tsCauseH={};
+window.__tsCause=c=>{window.__tsDeath++;window.__tsCauseH[c]=(window.__tsCauseH[c]||0)+1;};
+if(location.search.includes('autotest')){
+  // 无头模式：rAF 停摆，改用 setInterval 驱动
+  window.requestAnimationFrame=fn=>setTimeout(()=>fn(performance.now()),16);
+  let mode=location.search.includes('suicide')?'suicide':'bot';
+  setInterval(()=>{
+    if(!S)return;
+    if(S.mode==='over'){if(performance.now()-S.overAt>600){const d=S.deaths;reset();window.__restarted=(window.__restarted||0)+1;}return;}
+    if(S.mode==='menu'){drop(W/2);return;}
+    if(S.falling)return; // 等落地
+    const b=S.queue[0];if(!b)return;
+    const half=HALF();
+    let T=0;for(const q of S.blocks)T+=q.w*(q.lx/half);
+    T+=S.wind*1.0;
+    if(mode==='suicide'){drop(W/2+half*0.92);return;}
+    // 最优配平：x = -T*half/w，加 5% 手抖 + 2.5% 大失误
+    let x=-T*half/Math.max(0.35,b.w);
+    x+=(Math.random()-0.5)*half*0.1;
+    if(Math.random()<0.025)x+=(Math.random()<0.5?-1:1)*half*0.5;
+    x=Math.max(-half*0.86,Math.min(half*0.86,x));
+    drop(W/2+x);
+  },120);
+  setInterval(()=>{
+    document.title='st='+S.mode+' sc='+S.score+' tl='+(S.tilt*180/Math.PI).toFixed(1)
+      +' bl='+S.blocks.length+' t='+S.t.toFixed(0)+' D='+window.__tsDeath
+      +' c='+JSON.stringify(window.__tsCauseH);
+  },250);
+}
+
+reset();
+let last=0;
+function loop(ts){
+  requestAnimationFrame(loop);
+  const dt=Math.min(0.05,(ts-last)/1000||0.016);last=ts;
+  step(dt);draw();
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

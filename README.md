@@ -8,6 +8,7 @@ One original addictive HTML5 mini-game demo per day — single-file, zero-depend
 
 | # | Date | Demo | Idea | Source |
 | --- | --- | --- | --- | --- |
+| #24 | 2026-10-02 | [Tipscale](tipscale-20261002/) | 点位置投放积木实时配平力矩，超 16° 打滑、超 30° 折断 | [source](tipscale-20261002) |
 | #23 | 2026-10-01 | [Orbita](orbit-hop-20261001/) | 切线甩出飞船被下一颗行星捕获的连击跳站，滞留塌缩逼你快决策 | [source](orbit-hop-20261001) |
 | #22 | 2026-09-30 | [Cutline](cutline-20260930/) | 点缆割断让吊货荡进移动船心的弹道预判 | [source](cutline-20260930) |
 | #21 | 2026-09-29 | [Paint Rush](paint-rush-20260929/) | 手指滚筒限时刷墙达标，黑刷抢地红漆扣时 | [source](paint-rush-20260929) |

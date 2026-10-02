@@ -8,6 +8,7 @@ English switch: [English](README.md)
 
 | # | Date | 在线试玩 | Idea | 源码 |
 | --- | --- | --- | --- | --- |
+| #24 | 2026-10-02 | [Tipscale（不倒天平）](tipscale-20261002/) | 点位置投放积木实时配平力矩，超 16° 打滑、超 30° 折断 | [source](tipscale-20261002) |
 | #23 | 2026-10-01 | [Orbita（星轨跳站）](orbit-hop-20261001/) | 切线甩出飞船被下一颗行星捕获的连击跳站，滞留塌缩逼你快决策 | [source](orbit-hop-20261001) |
 | #22 | 2026-09-30 | [Cutline（断缆投递）](cutline-20260930/) | 点缆割断让吊货荡进移动船心的弹道预判 | [source](cutline-20260930) |
 | #21 | 2026-09-29 | [Paint Rush（涂色冲刺）](paint-rush-20260929/) | 手指滚筒限时刷墙达标，黑刷抢地红漆扣时 | [source](paint-rush-20260929) |
